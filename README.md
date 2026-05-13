@@ -4,6 +4,14 @@
 
 브라우저 화면에서 요원 이름, 목표 근무시간, 고정 근무, 연가, 기타 근무, 주간/야간 인원 조건 등을 입력할 수 있습니다. 생성된 근무표는 화면에서 확인하고, 필요한 경우 엑셀 파일로 저장할 수 있습니다.
 
+## 다운로드
+
+<a href="https://github.com/magnetic10/work-scheduler-v3/releases/latest/download/work-scheduler-v3-windows.zip">
+  <img alt="Windows 실행파일 다운로드" src="https://img.shields.io/badge/Windows%20%EC%8B%A4%ED%96%89%ED%8C%8C%EC%9D%BC-%EB%8B%A4%EC%9A%B4%EB%A1%9C%EB%93%9C-2ea44f?style=for-the-badge">
+</a>
+
+최신 실행파일은 [Releases 페이지](https://github.com/magnetic10/work-scheduler-v3/releases/latest)에서도 받을 수 있습니다.
+
 ## 주요 기능
 
 - 월별 근무표 자동 생성
@@ -68,4 +76,3 @@ http://127.0.0.1:8007/
 
 - 이 프로그램은 Windows 환경을 기준으로 배포됩니다.
 - 업로드한 엑셀 서식과 생성한 결과 파일은 사용자의 PC 안에서만 처리됩니다.
-
