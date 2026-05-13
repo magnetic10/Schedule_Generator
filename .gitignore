@@ -22,6 +22,7 @@ docs/PROGRESS_LOG.md
 build/
 dist/
 *.spec
+!work-scheduler-v3.spec
 
 # User exported/imported files
 *.json

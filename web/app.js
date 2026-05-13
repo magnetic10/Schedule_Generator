@@ -22,6 +22,28 @@ const TOAST_DUPLICATE_WINDOW_MS = 4000;
 const TOAST_SHORT_TEXT_MAX_LENGTH = 60;
 const TOAST_SHORT_TEXT_DURATION_REDUCTION_MS = 2000;
 const TOAST_MIN_DURATION_MS = 1000;
+const DEFAULT_ADVANCED_PENALTY_ORDER = [
+  "five_rest_streak",
+  "day_streak_over_default",
+  "emergency_range",
+  "double_night_cycle",
+];
+const DEFAULT_MAX_CONSECUTIVE_DAY = 5;
+const DEFAULT_MAX_CONSECUTIVE_REST = 4;
+const SHIFT_COLOR_TYPES = [
+  { key: "day", label: "주", id: "Day", cssVar: "--shift-day-bg", defaultColor: "#ddf5d1" },
+  { key: "night", label: "야", id: "Night", cssVar: "--shift-night-bg", defaultColor: "#ffe4c9" },
+  { key: "off_night", label: "비", id: "OffNight", cssVar: "--shift-off-night-bg", defaultColor: "#d4f2f0" },
+  { key: "off", label: "휴", id: "Off", cssVar: "--shift-off-bg", defaultColor: "#e2e6ff" },
+  { key: "leave", label: "연", id: "Leave", cssVar: "--shift-leave-bg", defaultColor: "#eadcfb" },
+  { key: "custom", label: "기타", id: "Custom", cssVar: "--shift-custom-bg", defaultColor: "#fff1b8" },
+];
+const ADVANCED_PENALTY_ITEMS = [
+  { key: "five_rest_streak", label: "n+1일 연속 휴/연", controlId: "penaltyRankFiveRest" },
+  { key: "day_streak_over_default", label: "주간 5일 연속 초과", controlId: "penaltyRankDayStreak" },
+  { key: "emergency_range", label: "예외 범위 사용", controlId: "penaltyRankEmergency" },
+  { key: "double_night_cycle", label: "야비야비 사용", controlId: "penaltyRankDoubleNight" },
+];
 
 const state = {
   year: null,
@@ -35,7 +57,9 @@ const state = {
     useDayOnly: false,
     useWorkPeriod: false,
     showShiftColors: true,
+    useCustomShiftColors: false,
   },
+  shiftColorSettings: defaultShiftColorSettings(),
   specialShifts: {},
   uploadedTemplate: null,
   histories: [],
@@ -105,11 +129,23 @@ function bindEvents() {
     "usePreference",
     "allowLeaveAfterOffNight",
     "allowDoubleNightCycle",
+    "useAdvancedSettings",
+    "allowUserForcedRules",
     "showShiftColors",
+    "useCustomShiftColors",
     "useEmergencyRange",
   ]) {
     $(id).addEventListener("change", () => handleConditionToggleChange(id));
   }
+
+  for (const item of SHIFT_COLOR_TYPES) {
+    $(`shiftColor${item.id}`).addEventListener("change", () => handleShiftColorSettingChange(true));
+    $(`shiftTransparent${item.id}`).addEventListener("change", () => handleShiftColorSettingChange(true));
+  }
+
+  document.querySelectorAll("[data-stepper-target]").forEach((button) => {
+    button.addEventListener("click", handleSidebarNumberStepperClick);
+  });
 
   for (const id of [
     "targetDay",
@@ -122,9 +158,25 @@ function bindEvents() {
     "emergencyMaxDay",
     "emergencyMinNight",
     "emergencyMaxNight",
+    "maxConsecutiveDay",
+    "maxConsecutiveRest",
   ]) {
     $(id).addEventListener("change", () => {
       markDirty();
+      collectSidebar();
+      scheduleGuideRefresh();
+    });
+  }
+
+  for (const id of [
+    "penaltyRankEmergency",
+    "penaltyRankFiveRest",
+    "penaltyRankDayStreak",
+    "penaltyRankDoubleNight",
+  ]) {
+    $(id).addEventListener("change", () => {
+      markDirty();
+      handlePenaltyRankChange(id);
       collectSidebar();
       scheduleGuideRefresh();
     });
@@ -173,6 +225,12 @@ function bindEvents() {
 
 function handleConditionToggleChange(id) {
   markDirty();
+  if (id === "useAdvancedSettings" && !$("useAdvancedSettings").checked) {
+    resetAdvancedSettingsControlsToDefaults();
+  }
+  if (id === "useCustomShiftColors" && !$("useCustomShiftColors").checked) {
+    resetShiftTransparentControls();
+  }
   collectSidebar();
 
   const inputTableOptions = new Set([
@@ -186,13 +244,28 @@ function handleConditionToggleChange(id) {
   if (id === "useDayOnly" && state.flags.useDayOnly) {
     state.workers.forEach((worker) => pruneDedicatedFixedShifts(worker));
   }
+  if (
+    ["useAdvancedSettings", "allowUserForcedRules"].includes(id)
+    && state.flags.useDayOnly
+  ) {
+    if (!state.settings.allow_user_forced_rule_violations) {
+      state.workers.forEach((worker) => pruneDedicatedFixedShifts(worker));
+    }
+    renderInputTable();
+  }
 
   if (inputTableOptions.has(id)) {
     renderInputTable();
   }
 
-  if (id === "showShiftColors") {
+  if (id === "showShiftColors" || id === "useCustomShiftColors") {
+    syncShiftColorControls();
+    updateShiftColorStyleVars();
     updateRenderedShiftColors();
+  }
+
+  if (id === "useAdvancedSettings") {
+    syncAdvancedSettingsPanel();
   }
 
   if (state.repairEditing && ["useDayOnly", "useWorkPeriod"].includes(id)) {
@@ -200,6 +273,47 @@ function handleConditionToggleChange(id) {
   }
 
   scheduleGuideRefresh();
+}
+
+function handleShiftColorSettingChange(validateInvalid = false) {
+  markDirty();
+  state.flags.useCustomShiftColors = $("useCustomShiftColors").checked;
+  const result = collectShiftColorSettings(validateInvalid);
+  state.shiftColorSettings = result.settings;
+  if (result.invalid.length > 0) {
+    showTopToast("색상은 #RRGGBB 형식으로 입력해 주세요.", "warning", 3500);
+  }
+  syncShiftColorControls();
+  updateShiftColorStyleVars();
+  updateRenderedShiftColors();
+}
+
+function handleSidebarNumberStepperClick(event) {
+  const button = event.currentTarget;
+  if (!(button instanceof HTMLButtonElement)) return;
+  const input = $(button.dataset.stepperTarget);
+  if (!(input instanceof HTMLInputElement)) return;
+  const delta = Number(button.dataset.stepperDelta || 0);
+  if (!Number.isFinite(delta) || delta === 0 || input.disabled) return;
+
+  const step = Number.parseFloat(input.step || "1") || 1;
+  const min = input.min === "" ? Number.NEGATIVE_INFINITY : Number.parseFloat(input.min);
+  const max = input.max === "" ? Number.POSITIVE_INFINITY : Number.parseFloat(input.max);
+  const hasValue = String(input.value || "").trim() !== "";
+  let current = hasValue
+    ? Number.parseFloat(input.value)
+    : Number.isFinite(min)
+      ? min - (delta > 0 ? step : 0)
+      : 0;
+  if (!Number.isFinite(current)) current = 0;
+
+  let next = current + delta * step;
+  if (Number.isFinite(min)) next = Math.max(min, next);
+  if (Number.isFinite(max)) next = Math.min(max, next);
+  input.value = Number.isInteger(next) ? String(next) : String(Number(next.toFixed(4)));
+  input.focus();
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+  input.dispatchEvent(new Event("change", { bubbles: true }));
 }
 
 function markDirty() {
@@ -240,6 +354,8 @@ function applyDefaults(defaults) {
   state.flags.useDayOnly = Boolean(defaults.use_day_only);
   state.flags.useWorkPeriod = Boolean(defaults.use_work_period);
   state.flags.showShiftColors = Boolean(defaults.show_shift_colors);
+  state.flags.useCustomShiftColors = false;
+  state.shiftColorSettings = defaultShiftColorSettings();
 }
 
 function collectSidebar() {
@@ -250,6 +366,8 @@ function collectSidebar() {
   state.flags.useDayOnly = $("useDayOnly").checked;
   state.flags.useWorkPeriod = $("useWorkPeriod").checked;
   state.flags.showShiftColors = $("showShiftColors").checked;
+  state.flags.useCustomShiftColors = $("useCustomShiftColors").checked;
+  state.shiftColorSettings = collectShiftColorSettings(false).settings;
 
   state.settings = {
     target_day: toInt($("targetDay").value, 1),
@@ -265,7 +383,16 @@ function collectSidebar() {
     emergency_max_night: optionalInt($("emergencyMaxNight").value),
     use_preference: $("usePreference").checked,
     allow_leave_after_off_night: $("allowLeaveAfterOffNight").checked,
-    allow_double_night_cycle: $("allowDoubleNightCycle").checked,
+    use_advanced_settings: $("useAdvancedSettings").checked,
+    allow_double_night_cycle: $("useAdvancedSettings").checked && $("allowDoubleNightCycle").checked,
+    max_consecutive_day: $("useAdvancedSettings").checked
+      ? toInt($("maxConsecutiveDay").value, DEFAULT_MAX_CONSECUTIVE_DAY)
+      : DEFAULT_MAX_CONSECUTIVE_DAY,
+    max_consecutive_rest: $("useAdvancedSettings").checked
+      ? toInt($("maxConsecutiveRest").value, DEFAULT_MAX_CONSECUTIVE_REST)
+      : DEFAULT_MAX_CONSECUTIVE_REST,
+    allow_user_forced_rule_violations: $("useAdvancedSettings").checked && $("allowUserForcedRules").checked,
+    penalty_order: $("useAdvancedSettings").checked ? collectPenaltyOrder() : [...DEFAULT_ADVANCED_PENALTY_ORDER],
     special_shifts: { ...state.specialShifts },
   };
 }
@@ -281,7 +408,9 @@ function syncSidebarControls() {
   $("allowLeaveAfterOffNight").checked = Boolean(state.settings.allow_leave_after_off_night);
   $("allowDoubleNightCycle").checked = Boolean(state.settings.allow_double_night_cycle);
   $("showShiftColors").checked = state.flags.showShiftColors;
+  $("useCustomShiftColors").checked = state.flags.useCustomShiftColors;
   $("useEmergencyRange").checked = Boolean(state.settings.use_emergency_range);
+  $("useAdvancedSettings").checked = Boolean(state.settings.use_advanced_settings);
 
   $("targetDay").value = state.settings.target_day ?? 1;
   $("targetNight").value = state.settings.target_night ?? 2;
@@ -293,6 +422,178 @@ function syncSidebarControls() {
   $("emergencyMaxDay").value = state.settings.emergency_max_day ?? "";
   $("emergencyMinNight").value = state.settings.emergency_min_night ?? "";
   $("emergencyMaxNight").value = state.settings.emergency_max_night ?? "";
+  $("maxConsecutiveDay").value = state.settings.max_consecutive_day ?? DEFAULT_MAX_CONSECUTIVE_DAY;
+  $("maxConsecutiveRest").value = state.settings.max_consecutive_rest ?? DEFAULT_MAX_CONSECUTIVE_REST;
+  $("allowUserForcedRules").checked = Boolean(state.settings.allow_user_forced_rule_violations);
+  syncPenaltyRankControls(state.settings.penalty_order);
+  syncAdvancedSettingsPanel();
+  syncShiftColorControls();
+  updateShiftColorStyleVars();
+}
+
+function syncAdvancedSettingsPanel() {
+  const panel = $("advancedSettingsPanel");
+  if (!panel) return;
+  panel.classList.toggle("hidden", !$("useAdvancedSettings").checked);
+}
+
+function resetAdvancedSettingsControlsToDefaults() {
+  $("maxConsecutiveDay").value = DEFAULT_MAX_CONSECUTIVE_DAY;
+  $("maxConsecutiveRest").value = DEFAULT_MAX_CONSECUTIVE_REST;
+  $("allowDoubleNightCycle").checked = false;
+  $("allowUserForcedRules").checked = false;
+  syncPenaltyRankControls(DEFAULT_ADVANCED_PENALTY_ORDER);
+}
+
+function defaultShiftColorSettings() {
+  return Object.fromEntries(
+    SHIFT_COLOR_TYPES.map((item) => [
+      item.key,
+      { color: item.defaultColor, transparent: false },
+    ]),
+  );
+}
+
+function collectShiftColorSettings(validateInvalid = false) {
+  const current = normalizeShiftColorSettings(state.shiftColorSettings);
+  const settings = {};
+  const invalid = [];
+  const useCustom = $("useCustomShiftColors")?.checked ?? state.flags.useCustomShiftColors;
+  for (const item of SHIFT_COLOR_TYPES) {
+    const colorInput = $(`shiftColor${item.id}`);
+    const transparentInput = $(`shiftTransparent${item.id}`);
+    const rawColor = String(colorInput?.value || "").trim();
+    const normalizedColor = normalizeHexColor(rawColor);
+    if (rawColor && !normalizedColor && validateInvalid) {
+      invalid.push(item.key);
+      if (colorInput) colorInput.value = current[item.key].color;
+    }
+    settings[item.key] = {
+      color: normalizedColor || current[item.key].color || item.defaultColor,
+      transparent: useCustom && Boolean(transparentInput?.checked),
+    };
+  }
+  return { settings: normalizeShiftColorSettings(settings), invalid };
+}
+
+function normalizeShiftColorSettings(settings = {}) {
+  const defaults = defaultShiftColorSettings();
+  const normalized = {};
+  for (const item of SHIFT_COLOR_TYPES) {
+    const value = settings?.[item.key] || {};
+    normalized[item.key] = {
+      color: normalizeHexColor(value.color) || defaults[item.key].color,
+      transparent: Boolean(value.transparent),
+    };
+  }
+  return normalized;
+}
+
+function normalizeHexColor(value) {
+  const token = String(value || "").trim();
+  if (!token) return "";
+  const withHash = token.startsWith("#") ? token : `#${token}`;
+  return /^#[0-9a-fA-F]{6}$/.test(withHash) ? withHash.toUpperCase() : "";
+}
+
+function syncShiftColorControls() {
+  const settings = normalizeShiftColorSettings(state.shiftColorSettings);
+  state.shiftColorSettings = settings;
+  const optionsPanel = $("shiftColorOptions");
+  if (optionsPanel) optionsPanel.classList.toggle("hidden", !state.flags.showShiftColors);
+  const detailPanel = $("shiftColorDetailPanel");
+  if (detailPanel) detailPanel.classList.toggle("hidden", !state.flags.showShiftColors || !state.flags.useCustomShiftColors);
+  for (const item of SHIFT_COLOR_TYPES) {
+    const colorInput = $(`shiftColor${item.id}`);
+    const transparentInput = $(`shiftTransparent${item.id}`);
+    const preview = document.querySelector(`[data-shift-preview="${item.key}"]`);
+    if (colorInput) {
+      colorInput.value = settings[item.key].color;
+      colorInput.disabled = !state.flags.showShiftColors || !state.flags.useCustomShiftColors || settings[item.key].transparent;
+    }
+    if (transparentInput) {
+      transparentInput.checked = Boolean(settings[item.key].transparent);
+      transparentInput.disabled = !state.flags.showShiftColors || !state.flags.useCustomShiftColors;
+    }
+    if (preview) {
+      preview.style.background = state.flags.showShiftColors
+        ? shiftBackgroundForItem(item, settings[item.key])
+        : "transparent";
+    }
+  }
+}
+
+function resetShiftTransparentControls() {
+  const settings = normalizeShiftColorSettings(state.shiftColorSettings);
+  for (const item of SHIFT_COLOR_TYPES) {
+    settings[item.key].transparent = false;
+    const transparentInput = $(`shiftTransparent${item.id}`);
+    if (transparentInput) transparentInput.checked = false;
+  }
+  state.shiftColorSettings = settings;
+}
+
+function updateShiftColorStyleVars() {
+  const root = document.documentElement;
+  const settings = normalizeShiftColorSettings(state.shiftColorSettings);
+  for (const item of SHIFT_COLOR_TYPES) {
+    root.style.setProperty(item.cssVar, shiftBackgroundForItem(item, settings[item.key]));
+  }
+}
+
+function shiftBackgroundForItem(item, setting) {
+  if (setting?.transparent) return "transparent";
+  if (state.flags.useCustomShiftColors) return normalizeHexColor(setting?.color) || item.defaultColor;
+  return item.defaultColor;
+}
+
+function normalizedPenaltyOrder(order = []) {
+  const seen = new Set();
+  const normalized = [];
+  for (const key of order || []) {
+    if (DEFAULT_ADVANCED_PENALTY_ORDER.includes(key) && !seen.has(key)) {
+      normalized.push(key);
+      seen.add(key);
+    }
+  }
+  for (const key of DEFAULT_ADVANCED_PENALTY_ORDER) {
+    if (!seen.has(key)) normalized.push(key);
+  }
+  return normalized;
+}
+
+function collectPenaltyOrder() {
+  const ranked = ADVANCED_PENALTY_ITEMS.map((item, defaultIndex) => ({
+    key: item.key,
+    rank: toInt($(item.controlId).value, defaultIndex + 1),
+    defaultIndex,
+  }));
+  ranked.sort((a, b) => a.rank - b.rank || a.defaultIndex - b.defaultIndex);
+  return normalizedPenaltyOrder(ranked.map((item) => item.key));
+}
+
+function handlePenaltyRankChange(controlId) {
+  const item = ADVANCED_PENALTY_ITEMS.find((candidate) => candidate.controlId === controlId);
+  if (!item) return;
+
+  const currentOrder = normalizedPenaltyOrder(state.settings.penalty_order);
+  const oldIndex = currentOrder.indexOf(item.key);
+  const fallbackRank = oldIndex >= 0 ? oldIndex + 1 : 1;
+  const newIndex = clamp(toInt($(controlId).value, fallbackRank), 1, ADVANCED_PENALTY_ITEMS.length) - 1;
+  const nextOrder = currentOrder.filter((key) => key !== item.key);
+  nextOrder.splice(newIndex, 0, item.key);
+
+  state.settings.penalty_order = normalizedPenaltyOrder(nextOrder);
+  syncPenaltyRankControls(state.settings.penalty_order);
+}
+
+function syncPenaltyRankControls(order = []) {
+  const normalized = normalizedPenaltyOrder(order);
+  for (const item of ADVANCED_PENALTY_ITEMS) {
+    const rank = normalized.indexOf(item.key) + 1;
+    const control = $(item.controlId);
+    if (control) control.value = String(rank > 0 ? rank : 1);
+  }
 }
 
 function renderAll() {
@@ -452,6 +753,7 @@ function setWorkerDedicatedShift(worker, value) {
 
 function isShiftAllowedForWorker(worker, shift) {
   if (!shift || !(shift in SHIFT_LABELS)) return true;
+  if (state.settings.allow_user_forced_rule_violations) return true;
   const dedicatedShift = workerDedicatedShift(worker);
   if (dedicatedShift === "day") return !["night", "off_night"].includes(shift);
   if (dedicatedShift === "night") return shift !== "day";
@@ -460,6 +762,7 @@ function isShiftAllowedForWorker(worker, shift) {
 
 function pruneDedicatedFixedShifts(worker) {
   if (!worker?.fixed_shifts) return false;
+  if (state.settings.allow_user_forced_rule_violations) return false;
   let changed = false;
   for (const [day, shift] of Object.entries(worker.fixed_shifts)) {
     if (!isShiftAllowedForWorker(worker, shift)) {
@@ -768,6 +1071,7 @@ function buildSchedulePayload() {
     settings: {
       ...state.settings,
       special_shifts: { ...state.specialShifts },
+      shift_color_settings: normalizeShiftColorSettings(state.shiftColorSettings),
     },
     random_seed: state.randomSeed,
   };
@@ -851,7 +1155,6 @@ async function resetSettings(event) {
   });
   applyDefaults(data.defaults);
   trimFixedShiftsToMonth();
-  collectSidebar();
   renderAll();
   refreshGuide();
   $("confirmDialog").close();
@@ -936,7 +1239,10 @@ function buildStateSnapshot() {
     usePreference: Boolean(state.settings.use_preference),
     allowLeaveAfterOffNight: Boolean(state.settings.allow_leave_after_off_night),
     allowDoubleNightCycle: Boolean(state.settings.allow_double_night_cycle),
+    useAdvancedSettings: Boolean(state.settings.use_advanced_settings),
+    allowUserForcedRules: Boolean(state.settings.allow_user_forced_rule_violations),
     showShiftColors: state.flags.showShiftColors,
+    useCustomShiftColors: state.flags.useCustomShiftColors,
     useEmergencyRange: Boolean(state.settings.use_emergency_range),
   };
 
@@ -956,6 +1262,7 @@ function buildStateSnapshot() {
     },
     flags: { ...state.flags },
     options,
+    shiftColorSettings: normalizeShiftColorSettings(state.shiftColorSettings),
     settings: {
       ...state.settings,
       special_shifts: { ...state.specialShifts },
@@ -1045,6 +1352,7 @@ function applyStateSnapshot(snapshot, monthInfo) {
   const options = snapshot.options || {};
   state.settings = normalizeSettings({ ...options, ...(snapshot.settings || snapshot.toSettings || {}) });
   state.flags = normalizeFlags(snapshot.flags || options || {}, options, state.settings);
+  state.shiftColorSettings = normalizeShiftColorSettings(snapshot.shiftColorSettings || snapshot.settings?.shift_color_settings || {});
   state.settings.special_shifts = { ...state.specialShifts };
   state.workers = snapshot.workers.map((worker) => normalizeWorkerSnapshot(worker));
   state.uploadedTemplate = null;
@@ -1061,10 +1369,12 @@ function normalizeFlags(flags = {}, options = {}, settings = {}) {
     useDayOnly: boolFrom(flags.useDayOnly ?? flags.use_day_only ?? options.useDayOnly ?? options.use_day_only),
     useWorkPeriod: boolFrom(flags.useWorkPeriod ?? flags.use_work_period ?? options.useWorkPeriod ?? options.use_work_period),
     showShiftColors: boolFrom(flags.showShiftColors ?? flags.show_shift_colors ?? options.showShiftColors ?? options.show_shift_colors, true),
+    useCustomShiftColors: boolFrom(flags.useCustomShiftColors ?? flags.use_custom_shift_colors ?? options.useCustomShiftColors ?? options.use_custom_shift_colors),
   };
 }
 
 function normalizeSettings(settings = {}) {
+  const useAdvancedSettings = boolFrom(settings.use_advanced_settings ?? settings.useAdvancedSettings);
   return {
     target_day: toInt(settings.target_day, 1),
     target_night: toInt(settings.target_night, 2),
@@ -1079,7 +1389,21 @@ function normalizeSettings(settings = {}) {
     emergency_max_night: nullableInt(settings.emergency_max_night),
     use_preference: boolFrom(settings.use_preference ?? settings.usePreference),
     allow_leave_after_off_night: boolFrom(settings.allow_leave_after_off_night ?? settings.allowLeaveAfterOffNight),
-    allow_double_night_cycle: boolFrom(settings.allow_double_night_cycle ?? settings.allowDoubleNightCycle),
+    use_advanced_settings: useAdvancedSettings,
+    allow_double_night_cycle: useAdvancedSettings && boolFrom(settings.allow_double_night_cycle ?? settings.allowDoubleNightCycle),
+    allow_user_forced_rule_violations: (
+      useAdvancedSettings
+      && boolFrom(settings.allow_user_forced_rule_violations ?? settings.allowUserForcedRules)
+    ),
+    max_consecutive_day: useAdvancedSettings
+      ? clamp(toInt(settings.max_consecutive_day, DEFAULT_MAX_CONSECUTIVE_DAY), 1, 31)
+      : DEFAULT_MAX_CONSECUTIVE_DAY,
+    max_consecutive_rest: useAdvancedSettings
+      ? clamp(toInt(settings.max_consecutive_rest, DEFAULT_MAX_CONSECUTIVE_REST), 1, 31)
+      : DEFAULT_MAX_CONSECUTIVE_REST,
+    penalty_order: useAdvancedSettings
+      ? normalizedPenaltyOrder(settings.penalty_order)
+      : [...DEFAULT_ADVANCED_PENALTY_ORDER],
     special_shifts: { ...state.specialShifts },
   };
 }
@@ -1295,7 +1619,7 @@ function renderResult() {
   $("repairEditBtn").disabled = state.isSolving || state.histories.length === 0;
   $("repairApplyBtn").disabled = state.isSolving || Object.keys(state.repairEdits).length === 0;
   renderResultWarnings(result);
-  const repairChangedKeys = isRepairEditing ? new Set() : repairChangedCellSet(result);
+  const repairMarks = repairDisplayMarks(entry, result, isRepairEditing);
 
   const head = [
     `<th class="row-index-head row-index-sticky"></th>`,
@@ -1315,7 +1639,7 @@ function renderResult() {
       return `<tr>
         <td class="row-index-cell row-index-sticky">${rowIndex + 1}</td>
         <td class="name-sticky">${escapeHtml(row.name)}</td>
-        ${row.raw_days.map((raw, dayIndex) => renderResultDayCell(rowIndex, dayIndex + 1, raw, isRepairEditing, repairChangedKeys)).join("")}
+        ${row.raw_days.map((raw, dayIndex) => renderResultDayCell(rowIndex, dayIndex + 1, raw, isRepairEditing, repairMarks)).join("")}
         <td class="stat-cell stat-count-cell">${stats.day}</td>
         <td class="stat-cell stat-count-cell">${stats.night}</td>
         <td class="stat-cell stat-count-cell">${stats.offNight}</td>
@@ -1341,23 +1665,28 @@ function renderResult() {
   wrap.innerHTML = `<table class="schedule-table result-table ${isRepairEditing ? "repair-editing-table" : ""}" style="--result-days: ${result.days_in_month};"><colgroup>${colgroup}</colgroup><thead><tr>${head}</tr></thead><tbody>${rows}${dayCountRow}${nightCountRow}</tbody></table>`;
 }
 
-function renderResultDayCell(rowIndex, day, raw, isRepairEditing, repairChangedKeys = new Set()) {
+function renderResultDayCell(rowIndex, day, raw, isRepairEditing, repairMarks = emptyRepairMarks()) {
   const code = rawToShiftValue(raw);
   const display = displayShiftValue(raw);
   const visualCode = code || labelToCode(display);
   const shiftAttr = `data-result-shift="${escapeHtml(visualCode)}"`;
   const colorClass = state.flags.showShiftColors ? shiftClass(visualCode) : "";
-  const repairChanged = repairChangedKeys.has(repairEditKey(rowIndex, day));
-  const changedClass = repairChanged ? " repair-changed-cell" : "";
-  const changedTitle = repairChanged ? ` title="부분 재생성으로 변경된 칸"` : "";
+  const key = repairEditKey(rowIndex, day);
+  const markClass = repairCellMarkClass(repairMarks, key);
+  const markTitle = repairCellMarkTitle(repairMarks, key);
+  const changedTitle = markTitle ? ` title="${escapeHtml(markTitle)}"` : "";
   if (!isRepairEditing) {
-    return `<td ${shiftAttr}${changedTitle} class="result-day${changedClass} ${colorClass}">${escapeHtml(display)}</td>`;
+    return `<td ${shiftAttr}${changedTitle} class="result-day${markClass} ${colorClass}">${escapeHtml(display)}</td>`;
   }
 
   const locked = isResultCellInputFixed(rowIndex, day);
   const outsidePeriod = isOutsideWorkPeriod(state.workers[rowIndex] || {}, day);
   if (locked || outsidePeriod || display === "") {
-    const title = locked ? "입력표에서 고정한 근무" : outsidePeriod ? "근무 기간 밖" : "";
+    const title = locked
+      ? "입력표에서 고정한 근무"
+      : outsidePeriod
+        ? "근무 기간 밖"
+        : "";
     return `<td ${shiftAttr} class="result-day repair-locked-cell ${colorClass}" title="${escapeHtml(title)}">${escapeHtml(display)}</td>`;
   }
 
@@ -1365,8 +1694,10 @@ function renderResultDayCell(rowIndex, day, raw, isRepairEditing, repairChangedK
     .filter((option) => option.value)
     .map((option) => `<option value="${escapeHtml(option.value)}" ${option.value === code ? "selected" : ""}>${escapeHtml(option.label)}</option>`)
     .join("");
-  const edited = state.repairEdits[repairEditKey(rowIndex, day)] ? " repair-edited-cell" : "";
-  return `<td ${shiftAttr} class="result-day repair-edit-cell${edited} ${colorClass}">
+  const edited = Boolean(state.repairEdits[key]);
+  const editedClass = edited ? " repair-edited-cell repair-current-user-cell" : "";
+  const editMarkClass = edited ? "" : markClass;
+  return `<td ${shiftAttr}${changedTitle} class="result-day repair-edit-cell${editedClass}${editMarkClass} ${colorClass}">
     <select data-repair-row="${rowIndex}" data-repair-day="${day}" class="compact-select ${colorClass}">${options}</select>
   </td>`;
 }
@@ -1383,7 +1714,116 @@ function repairChangedCellSet(result) {
   return keys;
 }
 
+function emptyRepairMarks() {
+  return {
+    changed: new Set(),
+    currentUser: new Set(),
+    previousUser: new Set(),
+    allUser: new Set(),
+  };
+}
+
+function repairDisplayMarks(entry, result, isRepairEditing = false) {
+  const marks = emptyRepairMarks();
+  marks.changed = isRepairEditing ? new Set() : repairChangedCellSet(result);
+  marks.allUser = repairEditCellSet(repairUserEditCellsFromEntry(entry));
+  if (isRepairEditing) {
+    marks.previousUser = new Set(marks.allUser);
+    return marks;
+  }
+  marks.currentUser = repairEditCellSet(repairCurrentUserEditCellsFromEntry(entry));
+  return marks;
+}
+
+function repairCellMarkClass(marks, key) {
+  if (marks.currentUser.has(key)) return " repair-current-user-cell";
+  if (marks.previousUser.has(key)) return " repair-previous-user-cell";
+  if (marks.changed.has(key)) return " repair-auto-changed-cell";
+  return "";
+}
+
+function repairCellMarkTitle(marks, key) {
+  if (marks.currentUser.has(key)) return "이번 부분 편집에서 직접 수정한 칸";
+  if (marks.previousUser.has(key)) return "이전 부분 편집에서 직접 수정한 칸";
+  if (marks.changed.has(key)) return "부분 재생성으로 자동 변경된 칸";
+  return "";
+}
+
+function repairEditCellSet(cells) {
+  const keys = new Set();
+  for (const cell of cells || []) {
+    const normalized = normalizeRepairEditCell(cell);
+    if (normalized) keys.add(repairEditKey(normalized.worker_index, normalized.day));
+  }
+  return keys;
+}
+
+function repairUserEditCellsFromEntry(entry) {
+  const explicit = entry?.repairUserEditCells || entry?.result?.repair_user_edit_cells;
+  if (Array.isArray(explicit)) return normalizeRepairEditCells(explicit);
+  return repairCurrentUserEditCellsFromEntry(entry);
+}
+
+function repairCurrentUserEditCellsFromEntry(entry) {
+  const explicit = entry?.repairCurrentUserEditCells || entry?.result?.repair_current_user_edit_cells;
+  if (Array.isArray(explicit)) return normalizeRepairEditCells(explicit);
+  return repairUserLockedCellsFromResult(entry?.result);
+}
+
+function repairPreviousUserEditCellsFromEntry(entry) {
+  const explicit = entry?.repairPreviousUserEditCells || entry?.result?.repair_previous_user_edit_cells;
+  return Array.isArray(explicit) ? normalizeRepairEditCells(explicit) : [];
+}
+
+function repairUserLockedCellsFromResult(result) {
+  return normalizeRepairEditCells(
+    (result?.repair_changed_cells || [])
+      .filter((cell) => Boolean(cell.user_locked))
+      .map((cell) => ({
+        worker_index: cell.worker_index,
+        day: cell.day,
+        shift: cell.shift ?? cell.to,
+      })),
+  );
+}
+
+function normalizeRepairEditCells(cells) {
+  const normalized = [];
+  for (const cell of cells || []) {
+    const edit = normalizeRepairEditCell(cell);
+    if (edit) normalized.push(edit);
+  }
+  return normalized;
+}
+
+function normalizeRepairEditCell(cell) {
+  if (!cell) return null;
+  const workerIndex = Number(cell.worker_index ?? cell.workerIndex);
+  const day = Number(cell.day);
+  const shift = rawToShiftValue(cell.shift ?? cell.to ?? cell.value ?? "");
+  if (!Number.isInteger(workerIndex) || workerIndex < 0 || !Number.isInteger(day) || day < 1 || !shift) return null;
+  return { worker_index: workerIndex, day, shift };
+}
+
+function mergeRepairEditCells(...lists) {
+  const merged = new Map();
+  for (const list of lists) {
+    for (const cell of normalizeRepairEditCells(list)) {
+      merged.set(repairEditKey(cell.worker_index, cell.day), cell);
+    }
+  }
+  return Array.from(merged.values()).sort((a, b) => {
+    if (a.worker_index !== b.worker_index) return a.worker_index - b.worker_index;
+    return a.day - b.day;
+  });
+}
+
 function updateRenderedShiftColors() {
+  const inputSelects = $("inputTableWrap").querySelectorAll("select[data-day]");
+  inputSelects.forEach((select) => {
+    if (select.classList.contains("outside-period-select")) return;
+    applyShiftColorClass(select, select.value || "");
+  });
   const cells = $("resultTableWrap").querySelectorAll("[data-result-shift]");
   cells.forEach((cell) => {
     applyShiftColorClass(cell, cell.dataset.resultShift || "");
@@ -1425,17 +1865,20 @@ function cancelRepairEdit(shouldRender = true) {
 async function applyRepairEdit() {
   if (state.isSolving) return;
   if (!state.repairEditing || !state.repairBaseResult || !state.repairDraftResult) return;
-  const edits = Object.values(state.repairEdits);
-  if (edits.length === 0) {
+  const currentEdits = normalizeRepairEditCells(Object.values(state.repairEdits));
+  if (currentEdits.length === 0) {
     showTopToast("부분 편집된 칸이 없습니다.", "warning", 3500);
     return;
   }
 
   collectSidebar();
+  const entry = state.histories[state.selectedHistory];
+  const previousUserEditCells = repairUserEditCellsFromEntry(entry);
+  const lockedEdits = mergeRepairEditCells(previousUserEditCells, currentEdits);
   const payload = {
     request: buildSchedulePayload(),
     result: state.repairBaseResult,
-    edits,
+    edits: lockedEdits,
   };
 
   const controller = new AbortController();
@@ -1456,9 +1899,21 @@ async function applyRepairEdit() {
     if (!data.success) throw new Error(data.error || "부분 재생성에 실패했습니다.");
     completeProgressTask("resultSolve", "부분 재생성 완료");
     const changedCount = Number(data.result.repair_changed_count || 0);
+    const currentUserEditCells = normalizeRepairEditCells(currentEdits);
+    const allUserEditCells = mergeRepairEditCells(previousUserEditCells, currentUserEditCells);
+    const result = {
+      ...data.result,
+      repair_previous_user_edit_cells: previousUserEditCells,
+      repair_current_user_edit_cells: currentUserEditCells,
+      repair_user_edit_cells: allUserEditCells,
+    };
     state.histories.unshift({
       label: `${new Date().toLocaleTimeString()} 부분 재생성`,
-      result: data.result,
+      result,
+      repairPreviousUserEditCells: previousUserEditCells,
+      repairCurrentUserEditCells: currentUserEditCells,
+      repairUserEditCells: allUserEditCells,
+      parentHistoryLabel: entry?.label || "",
     });
     state.selectedHistory = 0;
     cancelRepairEdit(false);
@@ -1900,6 +2355,7 @@ function trimFixedShiftsToMonth() {
 }
 
 function shiftClass(code) {
+  if (!state.flags.showShiftColors) return "";
   if (!code) return "";
   if (code === "day") return "shift-day";
   if (code === "night") return "shift-night";

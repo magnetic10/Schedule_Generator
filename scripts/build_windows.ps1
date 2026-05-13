@@ -7,6 +7,9 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
 
+$env:PYTHONNOUSERSITE = "1"
+$env:PYINSTALLER_CONFIG_DIR = Join-Path $Root ".pyinstaller"
+
 $VenvPython = Join-Path (Split-Path -Parent $Root) ".venv\Scripts\python.exe"
 if (Test-Path $VenvPython) {
     $Python = $VenvPython
@@ -26,23 +29,7 @@ Remove-Item -LiteralPath "build", "dist" -Recurse -Force -ErrorAction SilentlyCo
 & $Python -m PyInstaller `
     --noconfirm `
     --clean `
-    --onedir `
-    --name "work-scheduler-v3" `
-    --add-data "web;web" `
-    --add-data "templates;templates" `
-    --collect-all "ortools" `
-    --collect-all "holidays" `
-    --collect-all "openpyxl" `
-    --collect-submodules "uvicorn" `
-    --exclude-module "pyarrow" `
-    --exclude-module "matplotlib" `
-    --exclude-module "PIL" `
-    --hidden-import "uvicorn.logging" `
-    --hidden-import "uvicorn.loops.auto" `
-    --hidden-import "uvicorn.protocols.http.auto" `
-    --hidden-import "uvicorn.protocols.websockets.auto" `
-    --hidden-import "uvicorn.lifespan.on" `
-    "launcher.py"
+    "work-scheduler-v3.spec"
 
 if ($LASTEXITCODE -ne 0) {
     throw "PyInstaller build failed with exit code $LASTEXITCODE"
@@ -91,7 +78,8 @@ $ReadmeTxt = Join-Path $DistDir "README.txt"
 
 [참고 사항]
 - Python 설치는 필요하지 않습니다.
-- 엑셀 다운로드 기능은 Microsoft Excel이 설치된 Windows 환경에서 사용하는 것을 권장합니다.
+- 엑셀 서식 불러오기와 엑셀 다운로드는 Microsoft Excel 설치 없이도 사용할 수 있습니다.
+- 복잡한 엑셀 서식을 사용하는 경우 다운로드 결과를 한 번 확인하는 것을 권장합니다.
 - 업로드한 엑셀 서식과 생성한 결과 파일은 사용자의 PC 안에서 처리됩니다.
 '@ | Set-Content -LiteralPath $ReadmeTxt -Encoding UTF8
 

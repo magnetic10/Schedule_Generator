@@ -38,6 +38,18 @@ class ScheduleSettings:
     use_preference: bool = False
     allow_leave_after_off_night: bool = False
     allow_double_night_cycle: bool = False
+    use_advanced_settings: bool = False
+    max_consecutive_day: int = 5
+    max_consecutive_rest: int = 4
+    allow_user_forced_rule_violations: bool = False
+    penalty_order: list[str] = field(
+        default_factory=lambda: [
+            "five_rest_streak",
+            "day_streak_over_default",
+            "emergency_range",
+            "double_night_cycle",
+        ]
+    )
     special_shifts: dict[str, int] = field(default_factory=dict)
 
 

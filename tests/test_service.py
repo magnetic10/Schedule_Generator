@@ -2,11 +2,13 @@
 
 import tempfile
 import unittest
+import os
 from pathlib import Path
 from unittest.mock import patch
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Border, Side
+from ortools.sat.python import cp_model
 
 from app.schemas import (
     RepairEdit,
@@ -40,19 +42,26 @@ from core.data_io import (
     _middle_worker_delete_row,
     _middle_worker_insert_row,
     _normalize_worker_footer_separator,
+    analyze_template_v3,
+    export_to_excel_openpyxl,
 )
 from core.models import Worker
 from core.scheduler import (
     DAY_WORKLOAD_GAP_PENALTY,
+    DAY_STREAK_OVER_DEFAULT_PENALTY,
     DOUBLE_NIGHT_CYCLE_PENALTY,
     EMERGENCY_DAY_PENALTY,
     FIVE_REST_STREAK_PENALTY,
+    GENERAL_FOUR_DAY_THEN_NIGHT_PENALTY,
+    GENERAL_THREE_DAY_THEN_NIGHT_PENALTY,
     PREFERENCE_MISMATCH_PENALTY,
     REPAIR_CHANGE_PENALTY,
     SchedulerError,
     SOLVER_MAX_TIME_SECONDS,
     TO_TARGET_DEVIATION_PENALTY,
+    _add_day_rest_shape_policy,
     _attempt_plans,
+    _penalty_values_from_cfg,
     solve_schedule,
 )
 
@@ -78,6 +87,31 @@ class ScheduleServiceTests(unittest.TestCase):
             else:
                 current = 0
         return longest
+
+    def _day_rest_shape_objective(self, pattern: list[int]) -> int:
+        model = cp_model.CpModel()
+        all_shifts = [SHIFT_DAY, SHIFT_NIGHT, SHIFT_OFF_NIGHT, SHIFT_OFF, SHIFT_LEAVE]
+        x = {}
+        for day, fixed_shift in enumerate(pattern):
+            for shift in all_shifts:
+                x[0, day, shift] = model.NewBoolVar(f"x_d{day}_s{shift}")
+                model.Add(x[0, day, shift] == int(shift == fixed_shift))
+
+        objective_terms = []
+        _add_day_rest_shape_policy(
+            model,
+            x,
+            [Worker(id=1, name="A")],
+            len(pattern),
+            objective_terms,
+            max_consecutive_day=5,
+            active_max_night_workers=1,
+        )
+        model.Minimize(sum(objective_terms))
+        solver = cp_model.CpSolver()
+        status = solver.Solve(model)
+        self.assertIn(status, (cp_model.OPTIMAL, cp_model.FEASIBLE))
+        return int(solver.ObjectiveValue())
 
     def test_month_info_uses_korean_holidays_for_default_target_hours(self) -> None:
         info = build_month_info(2026, 1)
@@ -223,6 +257,28 @@ class ScheduleServiceTests(unittest.TestCase):
         self.assertIn("이미 고정된 연가/근무 인정시간", message)
         self.assertIn("목표시간 8시간보다 많습니다", message)
 
+    def test_target_hours_must_be_entered_in_8_hour_units(self) -> None:
+        req = ScheduleRequest(
+            year=2026,
+            month=1,
+            workers=[WorkerInput(name="A", target_hours=141)],
+            settings=ScheduleSettings(
+                target_day=0,
+                target_night=0,
+                min_day=0,
+                max_day=1,
+                min_night=0,
+                max_night=1,
+            ),
+        )
+
+        with self.assertRaises(SchedulerError) as ctx:
+            build_leave_need_guide(req)
+
+        message = str(ctx.exception)
+        self.assertIn("근무시간 설정 오류", message)
+        self.assertIn("8시간 단위", message)
+
     def test_leave_guide_reports_fixed_off_exceeding_target_capacity(self) -> None:
         req = ScheduleRequest(
             year=2026,
@@ -321,6 +377,213 @@ class ScheduleServiceTests(unittest.TestCase):
             solve_request(req)
 
         self.assertIn("A: 주간 연속 일수가 6일로 규칙에 위배됩니다.", str(ctx.exception))
+
+    def test_advanced_day_streak_limit_allows_longer_run(self) -> None:
+        req = ScheduleRequest(
+            year=2026,
+            month=1,
+            workers=[
+                WorkerInput(name="A", target_hours=48, fixed_shifts={day: "day" for day in range(1, 7)}),
+            ],
+            settings=ScheduleSettings(
+                target_day=0,
+                target_night=0,
+                min_day=0,
+                max_day=1,
+                min_night=0,
+                max_night=0,
+                use_advanced_settings=True,
+                max_consecutive_day=7,
+            ),
+        )
+
+        result = solve_request(req)
+
+        self.assertEqual(result.rows[0].raw_days[:6], [SHIFT_DAY] * 6)
+
+    def test_max_day_streak_blocks_next_night(self) -> None:
+        req = ScheduleRequest(
+            year=2026,
+            month=1,
+            workers=[
+                WorkerInput(
+                    name="A",
+                    start_day=1,
+                    end_day=7,
+                    target_hours=56,
+                    fixed_shifts={
+                        1: "day",
+                        2: "day",
+                        3: "day",
+                        4: "day",
+                        5: "day",
+                        6: "night",
+                        7: "off_night",
+                    },
+                ),
+            ],
+            settings=ScheduleSettings(
+                target_day=0,
+                target_night=0,
+                min_day=0,
+                max_day=1,
+                min_night=0,
+                max_night=1,
+            ),
+        )
+
+        with self.assertRaises(SchedulerError):
+            solve_request(req)
+
+    def test_advanced_max_day_streak_blocks_next_night_at_configured_limit(self) -> None:
+        req = ScheduleRequest(
+            year=2026,
+            month=1,
+            workers=[
+                WorkerInput(
+                    name="A",
+                    start_day=1,
+                    end_day=9,
+                    target_hours=72,
+                    fixed_shifts={
+                        1: "day",
+                        2: "day",
+                        3: "day",
+                        4: "day",
+                        5: "day",
+                        6: "day",
+                        7: "day",
+                        8: "night",
+                        9: "off_night",
+                    },
+                ),
+            ],
+            settings=ScheduleSettings(
+                target_day=0,
+                target_night=0,
+                min_day=0,
+                max_day=1,
+                min_night=0,
+                max_night=1,
+                use_advanced_settings=True,
+                max_consecutive_day=7,
+            ),
+        )
+
+        with self.assertRaises(SchedulerError):
+            solve_request(req)
+
+    def test_day_only_shape_penalty_avoids_split_single_day_blocks(self) -> None:
+        req = ScheduleRequest(
+            year=2026,
+            month=1,
+            workers=[
+                WorkerInput(
+                    name="A",
+                    start_day=1,
+                    end_day=5,
+                    target_hours=16,
+                    fixed_shifts={1: "off", 5: "off"},
+                ),
+            ],
+            settings=ScheduleSettings(
+                target_day=0,
+                target_night=0,
+                min_day=0,
+                max_day=1,
+                min_night=0,
+                max_night=0,
+            ),
+        )
+
+        result = solve_request(req)
+
+        self.assertNotEqual(
+            result.rows[0].raw_days[:5],
+            [SHIFT_OFF, SHIFT_DAY, SHIFT_OFF, SHIFT_DAY, SHIFT_OFF],
+        )
+
+    def test_general_day_then_night_shape_penalties(self) -> None:
+        self.assertEqual(
+            self._day_rest_shape_objective([SHIFT_DAY, SHIFT_DAY, SHIFT_DAY, SHIFT_NIGHT]),
+            GENERAL_THREE_DAY_THEN_NIGHT_PENALTY,
+        )
+        self.assertEqual(
+            self._day_rest_shape_objective([SHIFT_DAY, SHIFT_DAY, SHIFT_DAY, SHIFT_DAY, SHIFT_NIGHT]),
+            GENERAL_FOUR_DAY_THEN_NIGHT_PENALTY,
+        )
+
+    def test_high_day_target_does_not_create_night_after_five_day_streak(self) -> None:
+        req = ScheduleRequest(
+            year=2026,
+            month=6,
+            workers=[WorkerInput(name=chr(65 + index), target_hours=168) for index in range(8)],
+            settings=ScheduleSettings(
+                target_day=5,
+                target_night=1,
+                min_day=1,
+                max_day=5,
+                min_night=1,
+                max_night=1,
+            ),
+        )
+
+        result = solve_request(req)
+
+        for row in result.rows:
+            for start in range(0, result.days_in_month - 5):
+                self.assertFalse(
+                    row.raw_days[start : start + 5] == [SHIFT_DAY] * 5
+                    and row.raw_days[start + 5] == SHIFT_NIGHT,
+                    msg=f"{row.name} {start + 1}일",
+                )
+
+    def test_advanced_day_streak_limit_can_be_stricter(self) -> None:
+        req = ScheduleRequest(
+            year=2026,
+            month=1,
+            workers=[
+                WorkerInput(name="A", target_hours=32, fixed_shifts={day: "day" for day in range(1, 5)}),
+            ],
+            settings=ScheduleSettings(
+                target_day=0,
+                target_night=0,
+                min_day=0,
+                max_day=1,
+                min_night=0,
+                max_night=0,
+                use_advanced_settings=True,
+                max_consecutive_day=3,
+            ),
+        )
+
+        with self.assertRaises(SchedulerError) as ctx:
+            solve_request(req)
+
+        self.assertIn("A: 주간 연속 일수가 4일로 규칙에 위배됩니다.", str(ctx.exception))
+
+    def test_user_forced_override_allows_fixed_day_streak(self) -> None:
+        req = ScheduleRequest(
+            year=2026,
+            month=1,
+            workers=[
+                WorkerInput(name="A", target_hours=48, fixed_shifts={day: "day" for day in range(1, 7)}),
+            ],
+            settings=ScheduleSettings(
+                target_day=0,
+                target_night=0,
+                min_day=0,
+                max_day=1,
+                min_night=0,
+                max_night=0,
+                use_advanced_settings=True,
+                allow_user_forced_rule_violations=True,
+            ),
+        )
+
+        result = solve_request(req)
+
+        self.assertEqual(result.rows[0].raw_days[:6], [SHIFT_DAY] * 6)
 
     def test_leave_guide_reports_daily_staffing_shortage_from_rest_inputs(self) -> None:
         req = ScheduleRequest(
@@ -445,6 +708,100 @@ class ScheduleServiceTests(unittest.TestCase):
         self.assertIn("1일 비번 다음 2일은 휴무", str(ctx.exception))
         self.assertIn("비번이 지정", str(ctx.exception))
 
+    def test_user_forced_override_allows_off_night_next_fixed_day(self) -> None:
+        req = ScheduleRequest(
+            year=2026,
+            month=1,
+            workers=[
+                WorkerInput(name="A", target_hours=24, fixed_shifts={1: "night", 2: "off_night", 3: "day"}),
+            ],
+            settings=ScheduleSettings(
+                target_day=0,
+                target_night=0,
+                min_day=0,
+                max_day=1,
+                min_night=0,
+                max_night=1,
+                use_advanced_settings=True,
+                allow_user_forced_rule_violations=True,
+            ),
+        )
+
+        result = solve_request(req)
+
+        self.assertEqual(result.rows[0].raw_days[:3], [SHIFT_NIGHT, SHIFT_OFF_NIGHT, SHIFT_DAY])
+
+    def test_user_forced_override_still_requires_night_before_off_night(self) -> None:
+        req = ScheduleRequest(
+            year=2026,
+            month=1,
+            workers=[
+                WorkerInput(name="A", target_hours=16, fixed_shifts={1: "day", 2: "off_night"}),
+            ],
+            settings=ScheduleSettings(
+                target_day=0,
+                target_night=0,
+                min_day=0,
+                max_day=1,
+                min_night=0,
+                max_night=1,
+                use_advanced_settings=True,
+                allow_user_forced_rule_violations=True,
+            ),
+        )
+
+        with self.assertRaises(SchedulerError) as ctx:
+            solve_request(req)
+
+        self.assertIn("2일 비번은 전날 1일이 야간", str(ctx.exception))
+
+    def test_user_forced_override_allows_two_fixed_nights_then_off(self) -> None:
+        req = ScheduleRequest(
+            year=2026,
+            month=1,
+            workers=[
+                WorkerInput(name="A", target_hours=16, fixed_shifts={1: "night", 2: "night", 3: "off"}),
+            ],
+            settings=ScheduleSettings(
+                target_day=0,
+                target_night=0,
+                min_day=0,
+                max_day=1,
+                min_night=0,
+                max_night=2,
+                use_advanced_settings=True,
+                allow_user_forced_rule_violations=True,
+            ),
+        )
+
+        result = solve_request(req)
+
+        self.assertEqual(result.rows[0].raw_days[:3], [SHIFT_NIGHT, SHIFT_NIGHT, SHIFT_OFF])
+
+    def test_user_forced_override_rejects_three_fixed_nights(self) -> None:
+        req = ScheduleRequest(
+            year=2026,
+            month=1,
+            workers=[
+                WorkerInput(name="A", target_hours=24, fixed_shifts={1: "night", 2: "night", 3: "night"}),
+            ],
+            settings=ScheduleSettings(
+                target_day=0,
+                target_night=0,
+                min_day=0,
+                max_day=1,
+                min_night=0,
+                max_night=3,
+                use_advanced_settings=True,
+                allow_user_forced_rule_violations=True,
+            ),
+        )
+
+        with self.assertRaises(SchedulerError) as ctx:
+            solve_request(req)
+
+        self.assertIn("야간은 사용자 강제 지정이어도 최대 2일", str(ctx.exception))
+
     def test_solver_does_not_extend_user_fixed_off_run(self) -> None:
         worker = Worker(
             id=0,
@@ -471,12 +828,29 @@ class ScheduleServiceTests(unittest.TestCase):
         self.assertGreaterEqual(SOLVER_MAX_TIME_SECONDS, 40.0)
 
     def test_solver_penalty_order_matches_policy(self) -> None:
-        self.assertGreater(EMERGENCY_DAY_PENALTY, FIVE_REST_STREAK_PENALTY)
-        self.assertGreater(FIVE_REST_STREAK_PENALTY, DOUBLE_NIGHT_CYCLE_PENALTY)
+        self.assertGreater(FIVE_REST_STREAK_PENALTY, DAY_STREAK_OVER_DEFAULT_PENALTY)
+        self.assertGreater(DAY_STREAK_OVER_DEFAULT_PENALTY, EMERGENCY_DAY_PENALTY)
+        self.assertGreater(EMERGENCY_DAY_PENALTY, DOUBLE_NIGHT_CYCLE_PENALTY)
         self.assertGreater(DOUBLE_NIGHT_CYCLE_PENALTY, REPAIR_CHANGE_PENALTY)
         self.assertGreater(REPAIR_CHANGE_PENALTY, TO_TARGET_DEVIATION_PENALTY)
 
-    def test_solver_attempt_order_prefers_no_emergency_before_other_fallbacks(self) -> None:
+    def test_custom_penalty_order_reassigns_ranked_penalties(self) -> None:
+        penalties = _penalty_values_from_cfg(
+            {
+                "penalty_order": [
+                    "double_night_cycle",
+                    "day_streak_over_default",
+                    "five_rest_streak",
+                    "emergency_range",
+                ],
+            }
+        )
+
+        self.assertGreater(penalties["double_night_cycle"], penalties["day_streak_over_default"])
+        self.assertGreater(penalties["day_streak_over_default"], penalties["five_rest_streak"])
+        self.assertGreater(penalties["five_rest_streak"], penalties["emergency_range"])
+
+    def test_solver_attempt_order_uses_default_ranked_penalties(self) -> None:
         plans = _attempt_plans({"allow_double_night_cycle": True, "use_emergency_range": True})
 
         self.assertEqual(
@@ -493,6 +867,16 @@ class ScheduleServiceTests(unittest.TestCase):
                     "allow_double_night_cycle": True,
                 },
                 {
+                    "allow_emergency_range": True,
+                    "allow_auto_five_off_streaks": False,
+                    "allow_double_night_cycle": False,
+                },
+                {
+                    "allow_emergency_range": True,
+                    "allow_auto_five_off_streaks": False,
+                    "allow_double_night_cycle": True,
+                },
+                {
                     "allow_emergency_range": False,
                     "allow_auto_five_off_streaks": True,
                     "allow_double_night_cycle": False,
@@ -504,16 +888,6 @@ class ScheduleServiceTests(unittest.TestCase):
                 },
                 {
                     "allow_emergency_range": True,
-                    "allow_auto_five_off_streaks": False,
-                    "allow_double_night_cycle": False,
-                },
-                {
-                    "allow_emergency_range": True,
-                    "allow_auto_five_off_streaks": False,
-                    "allow_double_night_cycle": True,
-                },
-                {
-                    "allow_emergency_range": True,
                     "allow_auto_five_off_streaks": True,
                     "allow_double_night_cycle": False,
                 },
@@ -521,6 +895,41 @@ class ScheduleServiceTests(unittest.TestCase):
                     "allow_emergency_range": True,
                     "allow_auto_five_off_streaks": True,
                     "allow_double_night_cycle": True,
+                },
+            ],
+        )
+
+    def test_solver_attempt_order_follows_custom_penalty_order(self) -> None:
+        plans = _attempt_plans(
+            {
+                "allow_double_night_cycle": True,
+                "use_emergency_range": True,
+                "penalty_order": [
+                    "double_night_cycle",
+                    "five_rest_streak",
+                    "emergency_range",
+                    "day_streak_over_default",
+                ],
+            }
+        )
+
+        self.assertEqual(
+            plans[:3],
+            [
+                {
+                    "allow_emergency_range": False,
+                    "allow_auto_five_off_streaks": False,
+                    "allow_double_night_cycle": False,
+                },
+                {
+                    "allow_emergency_range": True,
+                    "allow_auto_five_off_streaks": False,
+                    "allow_double_night_cycle": False,
+                },
+                {
+                    "allow_emergency_range": False,
+                    "allow_auto_five_off_streaks": True,
+                    "allow_double_night_cycle": False,
                 },
             ],
         )
@@ -759,6 +1168,56 @@ class ScheduleServiceTests(unittest.TestCase):
         self.assertIn("야간 전담 근무자는", str(ctx.exception))
         self.assertIn("주간", str(ctx.exception))
 
+    def test_user_forced_override_allows_dedicated_fixed_night(self) -> None:
+        req = ScheduleRequest(
+            year=2026,
+            month=6,
+            workers=[
+                WorkerInput(
+                    name="A",
+                    target_hours=16,
+                    dedicated_shift="day",
+                    fixed_shifts={1: "night", 2: "off_night"},
+                )
+            ],
+            settings=ScheduleSettings(
+                target_day=0,
+                target_night=0,
+                min_day=0,
+                max_day=1,
+                min_night=0,
+                max_night=1,
+                use_advanced_settings=True,
+                allow_user_forced_rule_violations=True,
+            ),
+        )
+
+        result = solve_request(req)
+
+        self.assertEqual(result.rows[0].raw_days[:2], [SHIFT_NIGHT, SHIFT_OFF_NIGHT])
+
+    def test_user_forced_override_allows_fixed_to_shortage(self) -> None:
+        workers = [
+            Worker(id=0, name="A", target_hours=0, fixed_off_days=[0]),
+            Worker(id=1, name="B", target_hours=0, fixed_off_days=[0]),
+        ]
+
+        schedule, _, _ = solve_schedule(
+            workers,
+            1,
+            {
+                "tgt_d": 1,
+                "tgt_n": 0,
+                "allow_min_d": 1,
+                "allow_max_d": 1,
+                "allow_min_n": 0,
+                "allow_max_n": 0,
+                "allow_user_forced_rule_violations": True,
+            },
+        )
+
+        self.assertEqual(schedule, [[SHIFT_OFF], [SHIFT_OFF]])
+
     def test_solver_allows_user_fixed_five_day_off_run(self) -> None:
         worker = Worker(
             id=0,
@@ -787,6 +1246,18 @@ class ScheduleServiceTests(unittest.TestCase):
 
         self.assertEqual(schedule[0], [SHIFT_OFF] * 5)
         self.assertTrue(info["long_off_streak_fallback_used"])
+
+    def test_solver_respects_advanced_rest_streak_limit(self) -> None:
+        worker = Worker(id=0, name="A", target_hours=0)
+
+        schedule, _, info = solve_schedule(
+            [worker],
+            5,
+            {**self._zero_night_to_cfg(max_day=0), "max_consecutive_rest": 5},
+        )
+
+        self.assertEqual(schedule[0], [SHIFT_OFF] * 5)
+        self.assertFalse(info["long_off_streak_fallback_used"])
 
     def test_solver_counts_fixed_leave_inside_rest_streak(self) -> None:
         worker = Worker(
@@ -1497,7 +1968,9 @@ class ScheduleServiceTests(unittest.TestCase):
             night_counts=[0, 1],
         )
 
-        with patch("app.service.export_to_excel") as export_mock:
+        with patch.dict(os.environ, {"WORK_SCHEDULER_EXCEL_ENGINE": "xlwings"}), patch(
+            "app.service.export_to_excel"
+        ) as export_mock:
             export_result = export_schedule_result_to_excel(
                 template_path="template.xlsx",
                 output_path=str(Path("out") / default_excel_filename(2026, 6)),
@@ -1516,6 +1989,158 @@ class ScheduleServiceTests(unittest.TestCase):
         self.assertEqual(kwargs["schedule"], [[SHIFT_DAY, "교육"], [SHIFT_OFF, SHIFT_NIGHT]])
         self.assertEqual(export_result.filename, default_excel_filename(2026, 6))
         self.assertEqual(export_result.worker_count, 2)
+
+    def test_export_schedule_result_to_excel_uses_openpyxl_engine_when_configured(self) -> None:
+        result = ScheduleResult(
+            year=2026,
+            month=6,
+            days_in_month=1,
+            status="OPTIMAL",
+            rows=[WorkerScheduleRow(name="A", days=["주"], raw_days=[SHIFT_DAY])],
+            day_counts=[1],
+            night_counts=[0],
+        )
+
+        with patch.dict(os.environ, {"WORK_SCHEDULER_EXCEL_ENGINE": "openpyxl"}), patch(
+            "app.service.export_to_excel_openpyxl"
+        ) as export_mock:
+            export_schedule_result_to_excel(
+                template_path="template.xlsx",
+                output_path=str(Path("out") / default_excel_filename(2026, 6)),
+                result=result,
+            )
+
+        export_mock.assert_called_once()
+        self.assertEqual(export_mock.call_args.kwargs["workers"][0].name, "A")
+
+    def test_export_schedule_result_to_excel_uses_openpyxl_engine_by_default(self) -> None:
+        result = ScheduleResult(
+            year=2026,
+            month=6,
+            days_in_month=1,
+            status="OPTIMAL",
+            rows=[WorkerScheduleRow(name="A", days=["주"], raw_days=[SHIFT_DAY])],
+            day_counts=[1],
+            night_counts=[0],
+        )
+
+        with patch.dict(os.environ, {}, clear=True), patch(
+            "app.service.export_to_excel_openpyxl"
+        ) as export_mock:
+            export_schedule_result_to_excel(
+                template_path="template.xlsx",
+                output_path=str(Path("out") / default_excel_filename(2026, 6)),
+                result=result,
+            )
+
+        export_mock.assert_called_once()
+        self.assertEqual(export_mock.call_args.kwargs["workers"][0].name, "A")
+
+    def test_export_to_excel_openpyxl_writes_default_template_without_excel_app(self) -> None:
+        template_path = Path(__file__).resolve().parents[1] / "templates" / "default_template.xlsx"
+        workers = [
+            Worker(id=0, name="김철수"),
+            Worker(id=1, name="박영희"),
+            Worker(id=2, name="이민수"),
+        ]
+        schedule = [
+            [SHIFT_DAY] + [SHIFT_OFF] * 30,
+            [SHIFT_NIGHT, SHIFT_OFF_NIGHT] + [SHIFT_OFF] * 29,
+            ["훈"] + [SHIFT_DAY] * 30,
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "openpyxl_export.xlsx"
+            export_to_excel_openpyxl(
+                template_path=str(template_path),
+                output_path=str(output_path),
+                workers=workers,
+                schedule=schedule,
+                num_days=31,
+                year=2026,
+                month=5,
+            )
+
+            self.assertTrue(output_path.exists())
+            updated = load_workbook(output_path, data_only=False)
+            ws = updated.worksheets[0]
+            info = analyze_template_v3(ws)
+            date_col = info["date_col_start"]
+            date_row = info["date_row"]
+            name_col = info["name_col"]
+            worker_row = info["worker_row_start"]
+            data_row = worker_row + info["worker_data_row_offset"]
+
+            self.assertEqual(ws.cell(date_row, date_col).value, 1)
+            self.assertEqual(ws.cell(date_row, date_col + 30).value, 31)
+            self.assertEqual(ws.cell(worker_row, name_col).value, "김철수")
+            self.assertEqual(ws.cell(worker_row + info["worker_row_step"], name_col).value, "박영희")
+            self.assertEqual(ws.cell(data_row, date_col).value, "주")
+            self.assertEqual(ws.cell(data_row + info["worker_row_step"], date_col).value, "야")
+            self.assertEqual(ws.cell(data_row + info["worker_row_step"], date_col + 1).value, "비")
+            self.assertEqual(ws.cell(data_row + info["worker_row_step"] * 2, date_col).value, "훈")
+            updated.close()
+
+    def test_export_to_excel_openpyxl_expands_custom_template_date_and_worker_ranges(self) -> None:
+        wb = Workbook()
+        ws = wb.active
+        ws["A1"] = "2026년 6월 근무표"
+        ws["A3"] = "일자"
+        ws["A4"] = "요일"
+        for day in range(1, 31):
+            ws.cell(3, day + 1).value = day
+            ws.cell(4, day + 1).value = ["월", "화", "수", "목", "금", "토", "일"][(day - 1) % 7]
+        ws["A5"] = "김철수"
+        ws["A6"] = "박영희"
+        ws["AF4"] = "주"
+        ws["AG4"] = "야"
+        ws["AH4"] = "비"
+        ws["AI4"] = "휴"
+        ws["AF5"] = '=COUNTIF(B5:AE5,"주")'
+        ws["AF6"] = '=COUNTIF(B6:AE6,"주")'
+        ws["A7"] = "주간"
+        ws["B7"] = '=COUNTIF(B5:B6,"주")'
+        ws["A8"] = "야간"
+        ws["B8"] = '=COUNTIF(B5:B6,"야")'
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            template_path = Path(tmpdir) / "custom.xlsx"
+            output_path = Path(tmpdir) / "custom_out.xlsx"
+            wb.save(template_path)
+            wb.close()
+
+            workers = [
+                Worker(id=0, name="김철수"),
+                Worker(id=1, name="박영희"),
+                Worker(id=2, name="이민수"),
+            ]
+            schedule = [
+                [SHIFT_DAY] * 31,
+                [SHIFT_NIGHT, SHIFT_OFF_NIGHT] + [SHIFT_OFF] * 29,
+                [SHIFT_OFF] * 31,
+            ]
+            export_to_excel_openpyxl(
+                template_path=str(template_path),
+                output_path=str(output_path),
+                workers=workers,
+                schedule=schedule,
+                num_days=31,
+                year=2026,
+                month=7,
+            )
+
+            updated = load_workbook(output_path, data_only=False)
+            ws = updated.active
+            self.assertEqual(ws.cell(3, 32).value, 31)
+            self.assertEqual(ws.cell(5, 1).value, "김철수")
+            self.assertEqual(ws.cell(6, 1).value, "박영희")
+            self.assertEqual(ws.cell(7, 1).value, "이민수")
+            self.assertEqual(ws.cell(5, 2).value, "주")
+            self.assertEqual(ws.cell(6, 2).value, "야")
+            self.assertEqual(ws.cell(6, 3).value, "비")
+            self.assertEqual(ws.cell(8, 2).value, '=COUNTIF(B5:B7,"주")')
+            self.assertEqual(ws.cell(5, 33).value, '=COUNTIF(B5:AF5,"주")')
+            updated.close()
 
     def test_excel_merged_ranges_adjust_for_column_insert_and_delete(self) -> None:
         ranges = [(1, 1, 2, 31), (1, 32, 3, 36), (17, 1, 18, 46)]

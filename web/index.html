@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>근무표 생성기 V3</title>
     <link rel="icon" href="data:," />
-    <link rel="stylesheet" href="/web/styles.css?v=20260513-toast-dedupe" />
+    <link rel="stylesheet" href="/web/styles.css?v=20260513-template-help-text" />
   </head>
   <body>
     <button id="sidebarToggleBtn" class="sidebar-toggle" type="button" aria-expanded="true" aria-controls="sidebarPanel" title="좌측 바 접기">‹</button>
@@ -19,11 +19,12 @@
         </div>
 
         <section class="sidebar-section">
-          <h2>엑셀 서식 불러오기</h2>
+          <h2>엑셀 서식 불러오기 <span class="help" tabindex="0" data-tip="기존의 엑셀 근무표 양식을 불러와 자동으로 서식 적용이 가능합니다. 단, 오류가 있을 수 있으니 확인 바랍니다.">?</span></h2>
           <label class="file-picker">
             <input id="templateFile" type="file" accept=".xlsx" />
             <span>파일 선택</span>
           </label>
+          <p class="section-note">지원 확장자: .xlsx</p>
           <div id="uploadProgress" class="operation-progress hidden" aria-live="polite">
             <div class="progress-head">
               <span id="uploadProgressLabel">엑셀 업로드 중</span>
@@ -43,15 +44,33 @@
           <h2>기본 정보</h2>
           <label>
             <span>연도</span>
-            <input id="yearInput" type="number" min="2000" max="2100" />
+            <div class="number-stepper">
+              <input id="yearInput" type="number" min="2000" max="2100" />
+              <div class="number-stepper-buttons">
+                <button type="button" data-stepper-target="yearInput" data-stepper-delta="-1" aria-label="연도 감소">−</button>
+                <button type="button" data-stepper-target="yearInput" data-stepper-delta="1" aria-label="연도 증가">+</button>
+              </div>
+            </div>
           </label>
           <label>
             <span>월</span>
-            <input id="monthInput" type="number" min="1" max="12" />
+            <div class="number-stepper">
+              <input id="monthInput" type="number" min="1" max="12" />
+              <div class="number-stepper-buttons">
+                <button type="button" data-stepper-target="monthInput" data-stepper-delta="-1" aria-label="월 감소">−</button>
+                <button type="button" data-stepper-target="monthInput" data-stepper-delta="1" aria-label="월 증가">+</button>
+              </div>
+            </div>
           </label>
           <label class="wide">
             <span>월 목표 근무시간</span>
-            <input id="commonTargetInput" type="number" min="0" step="8" />
+            <div class="number-stepper">
+              <input id="commonTargetInput" type="number" min="0" step="8" />
+              <div class="number-stepper-buttons">
+                <button type="button" data-stepper-target="commonTargetInput" data-stepper-delta="-1" aria-label="월 목표 근무시간 감소">−</button>
+                <button type="button" data-stepper-target="commonTargetInput" data-stepper-delta="1" aria-label="월 목표 근무시간 증가">+</button>
+              </div>
+            </div>
           </label>
         </section>
 
@@ -62,26 +81,25 @@
           <label class="toggle-row"><input id="useWorkPeriod" type="checkbox" /> 근무 기간 설정 <span class="help" tabindex="0" data-tip="근무 시작/종료일을 설정합니다.">?</span></label>
           <label class="toggle-row"><input id="usePreference" type="checkbox" /> 근무 선호도 반영 <span class="help" tabindex="0" data-tip="개인의 야간/주간 선호도를 반영할 수 있습니다.">?</span></label>
           <label class="toggle-row"><input id="allowLeaveAfterOffNight" type="checkbox" /> 비번 후 연가 허용 <span class="help" tabindex="0" data-tip="연가 전날 야-비 근무를 허용합니다.">?</span></label>
-          <label class="toggle-row"><input id="allowDoubleNightCycle" type="checkbox" /> 야비야비 허용 <span class="help" tabindex="0" data-tip="해를 찾기 어려울 때 야-비-야-비-휴-휴 패턴을 허용합니다.">?</span></label>
         </section>
 
         <section class="sidebar-section compact-grid">
           <h2>기본 인원 설정</h2>
-          <label><span>주간 목표</span><input id="targetDay" type="number" min="0" /></label>
-          <label><span>야간 목표</span><input id="targetNight" type="number" min="0" /></label>
-          <label><span>주간 최소</span><input id="minDay" type="number" min="0" /></label>
-          <label><span>주간 최대</span><input id="maxDay" type="number" min="0" /></label>
-          <label><span>야간 최소</span><input id="minNight" type="number" min="0" /></label>
-          <label><span>야간 최대</span><input id="maxNight" type="number" min="0" /></label>
+          <label><span>주간 목표</span><div class="number-stepper"><input id="targetDay" type="number" min="0" /><div class="number-stepper-buttons"><button type="button" data-stepper-target="targetDay" data-stepper-delta="-1" aria-label="주간 목표 감소">−</button><button type="button" data-stepper-target="targetDay" data-stepper-delta="1" aria-label="주간 목표 증가">+</button></div></div></label>
+          <label><span>야간 목표</span><div class="number-stepper"><input id="targetNight" type="number" min="0" /><div class="number-stepper-buttons"><button type="button" data-stepper-target="targetNight" data-stepper-delta="-1" aria-label="야간 목표 감소">−</button><button type="button" data-stepper-target="targetNight" data-stepper-delta="1" aria-label="야간 목표 증가">+</button></div></div></label>
+          <label><span>주간 최소</span><div class="number-stepper"><input id="minDay" type="number" min="0" /><div class="number-stepper-buttons"><button type="button" data-stepper-target="minDay" data-stepper-delta="-1" aria-label="주간 최소 감소">−</button><button type="button" data-stepper-target="minDay" data-stepper-delta="1" aria-label="주간 최소 증가">+</button></div></div></label>
+          <label><span>주간 최대</span><div class="number-stepper"><input id="maxDay" type="number" min="0" /><div class="number-stepper-buttons"><button type="button" data-stepper-target="maxDay" data-stepper-delta="-1" aria-label="주간 최대 감소">−</button><button type="button" data-stepper-target="maxDay" data-stepper-delta="1" aria-label="주간 최대 증가">+</button></div></div></label>
+          <label><span>야간 최소</span><div class="number-stepper"><input id="minNight" type="number" min="0" /><div class="number-stepper-buttons"><button type="button" data-stepper-target="minNight" data-stepper-delta="-1" aria-label="야간 최소 감소">−</button><button type="button" data-stepper-target="minNight" data-stepper-delta="1" aria-label="야간 최소 증가">+</button></div></div></label>
+          <label><span>야간 최대</span><div class="number-stepper"><input id="maxNight" type="number" min="0" /><div class="number-stepper-buttons"><button type="button" data-stepper-target="maxNight" data-stepper-delta="-1" aria-label="야간 최대 감소">−</button><button type="button" data-stepper-target="maxNight" data-stepper-delta="1" aria-label="야간 최대 증가">+</button></div></div></label>
         </section>
 
         <section class="sidebar-section compact-grid">
           <h2>예외 범위 <span class="help" tabindex="0" data-tip="기본 인원 조건으로 해를 찾기 어려울 때만 최소한으로 사용되는 예외 범위입니다.">?</span></h2>
           <label class="toggle-row wide"><input id="useEmergencyRange" type="checkbox" /> 예외 범위 사용</label>
-          <label><span>주간 최소</span><input id="emergencyMinDay" type="number" min="0" /></label>
-          <label><span>주간 최대</span><input id="emergencyMaxDay" type="number" min="0" /></label>
-          <label><span>야간 최소</span><input id="emergencyMinNight" type="number" min="0" /></label>
-          <label><span>야간 최대</span><input id="emergencyMaxNight" type="number" min="0" /></label>
+          <label><span>주간 최소</span><div class="number-stepper"><input id="emergencyMinDay" type="number" min="0" /><div class="number-stepper-buttons"><button type="button" data-stepper-target="emergencyMinDay" data-stepper-delta="-1" aria-label="예외 주간 최소 감소">−</button><button type="button" data-stepper-target="emergencyMinDay" data-stepper-delta="1" aria-label="예외 주간 최소 증가">+</button></div></div></label>
+          <label><span>주간 최대</span><div class="number-stepper"><input id="emergencyMaxDay" type="number" min="0" /><div class="number-stepper-buttons"><button type="button" data-stepper-target="emergencyMaxDay" data-stepper-delta="-1" aria-label="예외 주간 최대 감소">−</button><button type="button" data-stepper-target="emergencyMaxDay" data-stepper-delta="1" aria-label="예외 주간 최대 증가">+</button></div></div></label>
+          <label><span>야간 최소</span><div class="number-stepper"><input id="emergencyMinNight" type="number" min="0" /><div class="number-stepper-buttons"><button type="button" data-stepper-target="emergencyMinNight" data-stepper-delta="-1" aria-label="예외 야간 최소 감소">−</button><button type="button" data-stepper-target="emergencyMinNight" data-stepper-delta="1" aria-label="예외 야간 최소 증가">+</button></div></div></label>
+          <label><span>야간 최대</span><div class="number-stepper"><input id="emergencyMaxNight" type="number" min="0" /><div class="number-stepper-buttons"><button type="button" data-stepper-target="emergencyMaxNight" data-stepper-delta="-1" aria-label="예외 야간 최대 감소">−</button><button type="button" data-stepper-target="emergencyMaxNight" data-stepper-delta="1" aria-label="예외 야간 최대 증가">+</button></div></div></label>
         </section>
 
         <section class="sidebar-section">
@@ -94,8 +112,117 @@
           <div id="specialList" class="special-list"></div>
         </section>
 
+        <section class="sidebar-section advanced-section">
+          <label class="toggle-row"><input id="useAdvancedSettings" type="checkbox" /> 고급 설정 활성화</label>
+          <div id="advancedSettingsPanel" class="advanced-settings hidden">
+            <label class="advanced-check-row">
+              <span>야비야비 허용 <span class="help" tabindex="0" data-tip="해를 찾기 어려울 때 야-비-야-비-휴-휴 패턴을 허용합니다.">?</span></span>
+              <input id="allowDoubleNightCycle" type="checkbox" />
+            </label>
+            <label class="advanced-check-row">
+              <span>사용자 강제 지정 허용 <span class="help" tabindex="0" data-tip="사용자가 지정한 근무 강제 허용">?</span></span>
+              <input id="allowUserForcedRules" type="checkbox" />
+            </label>
+
+            <h3>연속 제한 <span class="help" tabindex="0" data-tip="직접 지정한 근무는 제약에 해당되지 않습니다.">?</span></h3>
+            <label>
+              <span>주간 최대 연속</span>
+              <div class="number-stepper">
+                <input id="maxConsecutiveDay" type="number" min="1" max="31" value="5" />
+                <div class="number-stepper-buttons">
+                  <button type="button" data-stepper-target="maxConsecutiveDay" data-stepper-delta="-1" aria-label="주간 최대 연속 감소">−</button>
+                  <button type="button" data-stepper-target="maxConsecutiveDay" data-stepper-delta="1" aria-label="주간 최대 연속 증가">+</button>
+                </div>
+              </div>
+            </label>
+            <label>
+              <span>휴/연 최대 연속</span>
+              <div class="number-stepper">
+                <input id="maxConsecutiveRest" type="number" min="1" max="31" value="4" />
+                <div class="number-stepper-buttons">
+                  <button type="button" data-stepper-target="maxConsecutiveRest" data-stepper-delta="-1" aria-label="휴/연 최대 연속 감소">−</button>
+                  <button type="button" data-stepper-target="maxConsecutiveRest" data-stepper-delta="1" aria-label="휴/연 최대 연속 증가">+</button>
+                </div>
+              </div>
+            </label>
+
+            <h3>패널티 순위 <span class="help" tabindex="0" data-tip="1순위에 가까울수록 더 큰 패널티가 적용됩니다.">?</span></h3>
+            <label>
+              <span>n+1일 연속 휴/연 <span class="help" tabindex="0" data-tip="설정한 휴/연 최대 연속 일수 + 1일의 휴무/연가 연속입니다.">?</span></span>
+              <select id="penaltyRankFiveRest">
+                <option value="1">1순위</option>
+                <option value="2">2순위</option>
+                <option value="3">3순위</option>
+                <option value="4">4순위</option>
+              </select>
+            </label>
+            <label>
+              <span>주간 5일 연속 초과 <span class="help" tabindex="0" data-tip="주간 최대 연속 일수를 5일보다 크게 변경한 경우에만 적용됩니다.">?</span></span>
+              <select id="penaltyRankDayStreak">
+                <option value="1">1순위</option>
+                <option value="2">2순위</option>
+                <option value="3">3순위</option>
+                <option value="4">4순위</option>
+              </select>
+            </label>
+            <label>
+              <span>예외 범위 사용 <span class="help" tabindex="0" data-tip="'예외 범위'가 활성화된 경우에만 적용됩니다.">?</span></span>
+              <select id="penaltyRankEmergency">
+                <option value="1">1순위</option>
+                <option value="2">2순위</option>
+                <option value="3">3순위</option>
+                <option value="4">4순위</option>
+              </select>
+            </label>
+            <label>
+              <span>야비야비 사용 <span class="help" tabindex="0" data-tip="'야비야비 허용'이 활성화된 경우에만 적용됩니다.">?</span></span>
+              <select id="penaltyRankDoubleNight">
+                <option value="1">1순위</option>
+                <option value="2">2순위</option>
+                <option value="3">3순위</option>
+                <option value="4">4순위</option>
+              </select>
+            </label>
+          </div>
+        </section>
+
         <section class="sidebar-section">
-          <label class="toggle-row"><input id="showShiftColors" type="checkbox" checked /> 근무유형 색상 표시 <span class="help" tabindex="0" data-tip="결과표의 근무 유형을 색으로 구분합니다.">?</span></label>
+          <label class="toggle-row"><input id="showShiftColors" type="checkbox" checked /> 결과표 색상 표시 <span class="help" tabindex="0" data-tip="결과표의 근무 유형을 색으로 구분합니다.">?</span></label>
+          <div id="shiftColorOptions" class="shift-color-options">
+            <label class="toggle-row"><input id="useCustomShiftColors" type="checkbox" /> 배경색 직접 지정 <span class="help" tabindex="0" data-tip="근무 유형별 배경색을 #RRGGBB 형식으로 직접 지정합니다.">?</span></label>
+            <div id="shiftColorDetailPanel" class="shift-color-list hidden">
+              <div class="shift-color-row">
+                <span class="shift-color-preview" data-shift-preview="day">주</span>
+                <input id="shiftColorDay" class="hex-input" type="text" maxlength="7" spellcheck="false" aria-label="주간 배경색" />
+                <label><input id="shiftTransparentDay" type="checkbox" /> 투명</label>
+              </div>
+              <div class="shift-color-row">
+                <span class="shift-color-preview" data-shift-preview="night">야</span>
+                <input id="shiftColorNight" class="hex-input" type="text" maxlength="7" spellcheck="false" aria-label="야간 배경색" />
+                <label><input id="shiftTransparentNight" type="checkbox" /> 투명</label>
+              </div>
+              <div class="shift-color-row">
+                <span class="shift-color-preview" data-shift-preview="off_night">비</span>
+                <input id="shiftColorOffNight" class="hex-input" type="text" maxlength="7" spellcheck="false" aria-label="비번 배경색" />
+                <label><input id="shiftTransparentOffNight" type="checkbox" /> 투명</label>
+              </div>
+              <div class="shift-color-row">
+                <span class="shift-color-preview" data-shift-preview="off">휴</span>
+                <input id="shiftColorOff" class="hex-input" type="text" maxlength="7" spellcheck="false" aria-label="휴무 배경색" />
+                <label><input id="shiftTransparentOff" type="checkbox" /> 투명</label>
+              </div>
+              <div class="shift-color-row">
+                <span class="shift-color-preview" data-shift-preview="leave">연</span>
+                <input id="shiftColorLeave" class="hex-input" type="text" maxlength="7" spellcheck="false" aria-label="연가 배경색" />
+                <label><input id="shiftTransparentLeave" type="checkbox" /> 투명</label>
+              </div>
+              <div class="shift-color-row">
+                <span class="shift-color-preview" data-shift-preview="custom">기타</span>
+                <input id="shiftColorCustom" class="hex-input" type="text" maxlength="7" spellcheck="false" aria-label="기타 근무 배경색" />
+                <label><input id="shiftTransparentCustom" type="checkbox" /> 투명</label>
+              </div>
+            </div>
+          </div>
         </section>
 
         <button id="resetSettingsBtn" class="danger-outline" type="button">설정 초기화</button>
@@ -197,6 +324,6 @@
       </form>
     </dialog>
 
-    <script src="/web/app.js?v=20260513-toast-timing"></script>
+    <script src="/web/app.js?v=20260513-template-help-text"></script>
   </body>
 </html>

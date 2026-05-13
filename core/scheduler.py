@@ -30,15 +30,38 @@ class _SolveAttemptInfeasible(Exception):
 		self.status = status
 
 
-EMERGENCY_DAY_PENALTY = 1_000_000_000
-FIVE_REST_STREAK_PENALTY = 100_000_000
-DOUBLE_NIGHT_CYCLE_PENALTY = 10_000_000
-REPAIR_CHANGE_PENALTY = 1_000_000
+DEFAULT_MAX_CONSECUTIVE_DAY = 5
+DEFAULT_MAX_CONSECUTIVE_REST = 4
+PENALTY_KEY_EMERGENCY = "emergency_range"
+PENALTY_KEY_FIVE_REST = "five_rest_streak"
+PENALTY_KEY_DAY_STREAK = "day_streak_over_default"
+PENALTY_KEY_DOUBLE_NIGHT = "double_night_cycle"
+DEFAULT_PENALTY_ORDER = (
+	PENALTY_KEY_FIVE_REST,
+	PENALTY_KEY_DAY_STREAK,
+	PENALTY_KEY_EMERGENCY,
+	PENALTY_KEY_DOUBLE_NIGHT,
+)
+RANKED_PENALTY_VALUES = (1_000_000_000, 100_000_000, 10_000_000, 1_000_000)
+FIVE_REST_STREAK_PENALTY = 1_000_000_000
+DAY_STREAK_OVER_DEFAULT_PENALTY = 100_000_000
+EMERGENCY_DAY_PENALTY = 10_000_000
+DOUBLE_NIGHT_CYCLE_PENALTY = 1_000_000
+REPAIR_CHANGE_PENALTY = 100_000
 TO_TARGET_DEVIATION_PENALTY = 5_000
 FOUR_REST_STREAK_PENALTY = 2_500
 THREE_REST_STREAK_PENALTY = 250
 DAY_WORKLOAD_GAP_PENALTY = 30
 PREFERENCE_MISMATCH_PENALTY = 2
+DAY_ONLY_ONE_DAY_THEN_REST_PENALTY = 35
+DAY_ONLY_TWO_DAY_THEN_REST_PENALTY = 2
+DAY_ONLY_FOUR_DAY_SINGLE_REST_PENALTY = 4
+GENERAL_ONE_DAY_THEN_REST_PENALTY = 5
+GENERAL_THREE_DAY_THEN_NIGHT_PENALTY = 3
+GENERAL_FOUR_DAY_THEN_NIGHT_PENALTY = 100
+GENERAL_FOUR_DAY_THEN_DAY_PENALTY = 4
+MAX_DAY_SINGLE_REST_PENALTY = 70
+MAX_DAY_POST_REST_EXTRA_DAY_PENALTY = 50
 SOLVER_MAX_TIME_SECONDS = 40.0
 
 
@@ -50,6 +73,29 @@ def _cp_status_name(status: int) -> str:
 		cp_model.MODEL_INVALID: "MODEL_INVALID",
 		cp_model.UNKNOWN: "UNKNOWN",
 	}.get(status, str(status))
+
+
+def _normalize_penalty_order(order: Any) -> list[str]:
+	seen: set[str] = set()
+	normalized: list[str] = []
+	valid = set(DEFAULT_PENALTY_ORDER)
+	for key in order or []:
+		token = str(key or "").strip()
+		if token in valid and token not in seen:
+			normalized.append(token)
+			seen.add(token)
+	for key in DEFAULT_PENALTY_ORDER:
+		if key not in seen:
+			normalized.append(key)
+	return normalized
+
+
+def _penalty_values_from_cfg(cfg: dict) -> dict[str, int]:
+	order = _normalize_penalty_order(cfg.get("penalty_order"))
+	return {
+		key: RANKED_PENALTY_VALUES[index]
+		for index, key in enumerate(order)
+	}
 
 
 def _is_worker_active_on_day(worker: Worker, day: int) -> bool:
@@ -147,7 +193,17 @@ def _add_rest_streak_policy(
 	num_days: int,
 	objective_terms: list,
 	allow_auto_five_off_streaks: bool,
+	max_consecutive_rest: int,
+	five_rest_penalty: int,
 ) -> None:
+	limit_window_length = max(1, int(max_consecutive_rest)) + 1
+	penalty_by_length = {
+		3: THREE_REST_STREAK_PENALTY,
+		4: FOUR_REST_STREAK_PENALTY,
+		5: five_rest_penalty,
+	}
+	policy_lengths = sorted(set(penalty_by_length) | {limit_window_length})
+
 	for w_idx, worker in enumerate(workers):
 		forced = forced_by_worker[w_idx]
 
@@ -163,11 +219,7 @@ def _add_rest_streak_policy(
 					continue
 				model.Add(x[w_idx, adjacent_day, SHIFT_OFF] == 0)
 
-		for length, penalty in (
-			(3, THREE_REST_STREAK_PENALTY),
-			(4, FOUR_REST_STREAK_PENALTY),
-			(5, FIVE_REST_STREAK_PENALTY),
-		):
+		for length in policy_lengths:
 			if num_days < length:
 				continue
 			for start in range(0, num_days - length + 1):
@@ -178,10 +230,279 @@ def _add_rest_streak_policy(
 					continue
 
 				all_rest = _rest_window_indicator(model, x, w_idx, start, length)
-				if length == 5 and not allow_auto_five_off_streaks:
+				if length == limit_window_length and not allow_auto_five_off_streaks:
 					model.Add(all_rest == 0)
 				else:
-					objective_terms.append(all_rest * penalty)
+					penalty = penalty_by_length.get(length)
+					if penalty:
+						objective_terms.append(all_rest * penalty)
+
+
+def _day_window_indicator(
+	model: cp_model.CpModel,
+	x: dict,
+	w_idx: int,
+	start: int,
+	length: int,
+) -> cp_model.IntVar:
+	all_day = model.NewBoolVar(f"day_streak_w{w_idx}_d{start}_len{length}")
+	day_vars = [x[w_idx, day, SHIFT_DAY] for day in range(start, start + length)]
+	model.AddBoolAnd(day_vars).OnlyEnforceIf(all_day)
+	model.AddBoolOr([day_var.Not() for day_var in day_vars] + [all_day])
+	return all_day
+
+
+def _and_indicator(
+	model: cp_model.CpModel,
+	name: str,
+	literals: list,
+) -> cp_model.IntVar:
+	indicator = model.NewBoolVar(name)
+	model.AddBoolAnd(literals).OnlyEnforceIf(indicator)
+	model.AddBoolOr([literal.Not() for literal in literals] + [indicator])
+	return indicator
+
+
+def _active_on_all_days(worker: Worker, days: range) -> bool:
+	return all(_is_worker_active_on_day(worker, day) for day in days)
+
+
+def _uses_day_only_shape_rules(worker: Worker, max_night_workers: int) -> bool:
+	return max_night_workers <= 0 or _worker_dedicated_shift(worker) == "day"
+
+
+def _add_day_streak_policy(
+	model: cp_model.CpModel,
+	x: dict,
+	workers: List[Worker],
+	forced_by_worker: List[Dict[int, int | str]],
+	num_days: int,
+	objective_terms: list,
+	max_consecutive_day: int,
+	day_streak_penalty: int,
+	allow_user_forced_rule_violations: bool,
+) -> None:
+	max_allowed = max(1, int(max_consecutive_day))
+	if max_allowed < num_days:
+		for w_idx in range(len(workers)):
+			forced = forced_by_worker[w_idx]
+			for start in range(0, num_days - max_allowed):
+				window = range(start, start + max_allowed + 1)
+				if (
+					allow_user_forced_rule_violations
+					and all(forced.get(day) == SHIFT_DAY for day in window)
+				):
+					continue
+				model.Add(
+					sum(x[w_idx, day, SHIFT_DAY] for day in window) <= max_allowed
+				)
+
+		for w_idx in range(len(workers)):
+			for start in range(0, num_days - max_allowed):
+				window = range(start, start + max_allowed)
+				next_day = start + max_allowed
+				model.AddBoolOr(
+					[x[w_idx, day, SHIFT_DAY].Not() for day in window]
+					+ [x[w_idx, next_day, SHIFT_NIGHT].Not()]
+				)
+
+	if max_allowed <= DEFAULT_MAX_CONSECUTIVE_DAY or num_days <= DEFAULT_MAX_CONSECUTIVE_DAY:
+		return
+
+	soft_window_length = DEFAULT_MAX_CONSECUTIVE_DAY + 1
+	for w_idx, worker in enumerate(workers):
+		for start in range(0, num_days - soft_window_length + 1):
+			window = range(start, start + soft_window_length)
+			if any(not _is_worker_active_on_day(worker, day) for day in window):
+				continue
+			all_day = _day_window_indicator(model, x, w_idx, start, soft_window_length)
+			objective_terms.append(all_day * day_streak_penalty)
+
+
+def _add_day_rest_shape_policy(
+	model: cp_model.CpModel,
+	x: dict,
+	workers: List[Worker],
+	num_days: int,
+	objective_terms: list,
+	max_consecutive_day: int,
+	active_max_night_workers: int,
+) -> None:
+	max_allowed = max(1, int(max_consecutive_day))
+
+	for w_idx, worker in enumerate(workers):
+		day_only_rules = _uses_day_only_shape_rules(worker, active_max_night_workers)
+
+		for start in range(1, num_days - 1):
+			window = range(start - 1, start + 2)
+			if not _active_on_all_days(worker, window):
+				continue
+			rest_next = _rest_day_indicator(model, x, w_idx, start + 1)
+			one_day_then_rest = _and_indicator(
+				model,
+				f"one_day_then_rest_w{w_idx}_d{start}",
+				[
+					x[w_idx, start - 1, SHIFT_DAY].Not(),
+					x[w_idx, start, SHIFT_DAY],
+					rest_next,
+				],
+			)
+			objective_terms.append(
+				one_day_then_rest
+				* (
+					DAY_ONLY_ONE_DAY_THEN_REST_PENALTY
+					if day_only_rules
+					else GENERAL_ONE_DAY_THEN_REST_PENALTY
+				)
+			)
+
+		if day_only_rules:
+			for start in range(1, num_days - 2):
+				window = range(start - 1, start + 3)
+				if not _active_on_all_days(worker, window):
+					continue
+				rest_next = _rest_day_indicator(model, x, w_idx, start + 2)
+				two_day_then_rest = _and_indicator(
+					model,
+					f"two_day_then_rest_w{w_idx}_d{start}",
+					[
+						x[w_idx, start - 1, SHIFT_DAY].Not(),
+						x[w_idx, start, SHIFT_DAY],
+						x[w_idx, start + 1, SHIFT_DAY],
+						rest_next,
+					],
+				)
+				objective_terms.append(two_day_then_rest * DAY_ONLY_TWO_DAY_THEN_REST_PENALTY)
+
+			for start in range(1, num_days - 5):
+				window = range(start - 1, start + 6)
+				if not _active_on_all_days(worker, window):
+					continue
+				rest_after_run = _rest_day_indicator(model, x, w_idx, start + 4)
+				rest_after_single_rest = _rest_day_indicator(model, x, w_idx, start + 5)
+				four_day_single_rest = _and_indicator(
+					model,
+					f"day_only_four_day_single_rest_w{w_idx}_d{start}",
+					[
+						x[w_idx, start - 1, SHIFT_DAY].Not(),
+						x[w_idx, start, SHIFT_DAY],
+						x[w_idx, start + 1, SHIFT_DAY],
+						x[w_idx, start + 2, SHIFT_DAY],
+						x[w_idx, start + 3, SHIFT_DAY],
+						rest_after_run,
+						rest_after_single_rest.Not(),
+					],
+				)
+				objective_terms.append(
+					four_day_single_rest * DAY_ONLY_FOUR_DAY_SINGLE_REST_PENALTY
+				)
+		else:
+			for start in range(0, num_days - 3):
+				window = range(start, start + 4)
+				if not _active_on_all_days(worker, window):
+					continue
+				literals = [
+					x[w_idx, start, SHIFT_DAY],
+					x[w_idx, start + 1, SHIFT_DAY],
+					x[w_idx, start + 2, SHIFT_DAY],
+					x[w_idx, start + 3, SHIFT_NIGHT],
+				]
+				if start > 0 and _is_worker_active_on_day(worker, start - 1):
+					literals.insert(0, x[w_idx, start - 1, SHIFT_DAY].Not())
+				three_day_then_night = _and_indicator(
+					model,
+					f"general_three_day_then_night_w{w_idx}_d{start}",
+					literals,
+				)
+				objective_terms.append(
+					three_day_then_night * GENERAL_THREE_DAY_THEN_NIGHT_PENALTY
+				)
+
+			for start in range(0, num_days - 4):
+				window = range(start, start + 5)
+				if not _active_on_all_days(worker, window):
+					continue
+				four_day_then_night = _and_indicator(
+					model,
+					f"general_four_day_then_night_w{w_idx}_d{start}",
+					[
+						x[w_idx, start, SHIFT_DAY],
+						x[w_idx, start + 1, SHIFT_DAY],
+						x[w_idx, start + 2, SHIFT_DAY],
+						x[w_idx, start + 3, SHIFT_DAY],
+						x[w_idx, start + 4, SHIFT_NIGHT],
+					],
+				)
+				objective_terms.append(four_day_then_night * GENERAL_FOUR_DAY_THEN_NIGHT_PENALTY)
+
+				four_day_then_day = _and_indicator(
+					model,
+					f"general_four_day_then_day_w{w_idx}_d{start}",
+					[
+						x[w_idx, start, SHIFT_DAY],
+						x[w_idx, start + 1, SHIFT_DAY],
+						x[w_idx, start + 2, SHIFT_DAY],
+						x[w_idx, start + 3, SHIFT_DAY],
+						x[w_idx, start + 4, SHIFT_DAY],
+					],
+				)
+				objective_terms.append(four_day_then_day * GENERAL_FOUR_DAY_THEN_DAY_PENALTY)
+
+		if max_allowed + 1 >= num_days:
+			continue
+
+		for start in range(0, num_days - max_allowed - 1):
+			base_days = range(start, start + max_allowed)
+			rest_day = start + max_allowed
+			next_day = rest_day + 1
+			if not _active_on_all_days(worker, range(start, next_day + 1)):
+				continue
+			rest_after_max = _rest_day_indicator(model, x, w_idx, rest_day)
+			second_rest = _rest_day_indicator(model, x, w_idx, next_day)
+			single_rest_after_max = _and_indicator(
+				model,
+				f"max_day_single_rest_w{w_idx}_d{start}",
+				[
+					*[x[w_idx, day, SHIFT_DAY] for day in base_days],
+					rest_after_max,
+					second_rest.Not(),
+				],
+			)
+			objective_terms.append(single_rest_after_max * MAX_DAY_SINGLE_REST_PENALTY)
+
+			for extra_day in range(next_day + 1, num_days):
+				if not _active_on_all_days(worker, range(start, extra_day + 1)):
+					continue
+				extra_day_after_short_rest = _and_indicator(
+					model,
+					f"max_day_post_rest_extra_day_w{w_idx}_d{start}_extra{extra_day}",
+					[
+						*[x[w_idx, day, SHIFT_DAY] for day in base_days],
+						rest_after_max,
+						*[x[w_idx, day, SHIFT_DAY] for day in range(next_day, extra_day + 1)],
+					],
+				)
+				objective_terms.append(
+					extra_day_after_short_rest * MAX_DAY_POST_REST_EXTRA_DAY_PENALTY
+				)
+
+
+def _find_night_after_max_day_streak(
+	schedule: List[List[int | str]],
+	workers: List[Worker],
+	max_consecutive_day: int,
+) -> tuple[int, int] | None:
+	max_allowed = max(1, int(max_consecutive_day))
+	for w_idx, row in enumerate(schedule):
+		if len(row) <= max_allowed:
+			continue
+		for start in range(0, len(row) - max_allowed):
+			next_day = start + max_allowed
+			if not _active_on_all_days(workers[w_idx], range(start, next_day + 1)):
+				continue
+			if all(row[day] == SHIFT_DAY for day in range(start, next_day)) and row[next_day] == SHIFT_NIGHT:
+				return w_idx, start
+	return None
 
 
 def _build_to_config(to_cfg: dict | None) -> dict:
@@ -206,6 +527,10 @@ def _build_to_config(to_cfg: dict | None) -> dict:
 		"use_preference": bool(cfg.get("use_preference", False)),
 		"allow_leave_after_off_night": bool(cfg.get("allow_leave_after_off_night", False)),
 		"allow_double_night_cycle": bool(cfg.get("allow_double_night_cycle", False)),
+		"max_consecutive_day": max(1, int(cfg.get("max_consecutive_day", DEFAULT_MAX_CONSECUTIVE_DAY))),
+		"max_consecutive_rest": max(1, int(cfg.get("max_consecutive_rest", DEFAULT_MAX_CONSECUTIVE_REST))),
+		"allow_user_forced_rule_violations": bool(cfg.get("allow_user_forced_rule_violations", False)),
+		"penalty_order": _normalize_penalty_order(cfg.get("penalty_order")),
 	}
 
 
@@ -245,15 +570,67 @@ def _collect_forced_assignments(worker: Worker, num_days: int) -> Dict[int, int 
 	return forced
 
 
+def _is_user_forced_shift(forced: Dict[int, int | str], day: int, shift: int | None = None) -> bool:
+	value = forced.get(day)
+	if shift is None:
+		return value is not None
+	return value == shift
+
+
+def _is_forced_double_night_start(forced: Dict[int, int | str], day: int) -> bool:
+	return forced.get(day) == SHIFT_NIGHT and forced.get(day + 1) == SHIFT_NIGHT
+
+
+def _is_forced_double_night_second(forced: Dict[int, int | str], day: int) -> bool:
+	return day > 0 and forced.get(day - 1) == SHIFT_NIGHT and forced.get(day) == SHIFT_NIGHT
+
+
+def _previous_night_requires_off_night(
+	forced: Dict[int, int | str],
+	day: int,
+	allow_user_forced_rule_violations: bool,
+) -> bool:
+	if day <= 0 or forced.get(day - 1) != SHIFT_NIGHT:
+		return False
+	if allow_user_forced_rule_violations and _is_forced_double_night_second(forced, day - 1):
+		return False
+	return True
+
+
+def _validate_user_forced_override_patterns(
+	worker: Worker,
+	forced: Dict[int, int | str],
+	num_days: int,
+) -> None:
+	label = worker.name or "이름 없는 근무자"
+	for day in range(num_days - 2):
+		if (
+			forced.get(day) == SHIFT_NIGHT
+			and forced.get(day + 1) == SHIFT_NIGHT
+			and forced.get(day + 2) == SHIFT_NIGHT
+		):
+			raise SchedulerError(f"{label}: 야간은 사용자 강제 지정이어도 최대 2일까지만 연속 지정할 수 있습니다.")
+
+	for day in range(num_days - 1):
+		if not _is_forced_double_night_start(forced, day):
+			continue
+		rest_day = day + 2
+		if rest_day >= num_days:
+			raise SchedulerError(f"{label}: 야간 2연속 뒤에는 휴무가 필요합니다.")
+		if forced.get(rest_day) is not None and forced.get(rest_day) != SHIFT_OFF:
+			raise SchedulerError(f"{label}: 야간 2연속 뒤에는 휴무가 지정되어야 합니다.")
+
+
 def diagnose_infeasibility(workers: List[Worker], num_days: int, cfg: dict) -> str | None:
     """스케줄 생성이 불가능한 원인을 분석하여 설명 메시지를 반환한다."""
     min_d, min_n = _diagnostic_min_staffing(cfg)
     basis_label = "예외 범위" if bool(cfg.get("use_emergency_range", False)) else "기본 범위"
+    allow_user_forced_rule_violations = bool(cfg.get("allow_user_forced_rule_violations", False))
     reasons = []
 
     # 1. 일자별 최소 인원 충족 여부 (가장 흔한 원인)
     for d in range(num_days):
-        stats = _daily_capacity_stats(workers, num_days, d)
+        stats = _daily_capacity_stats(workers, num_days, d, allow_user_forced_rule_violations)
         fixed_day = stats["fixed_day"]
         fixed_night = stats["fixed_night"]
         fixed_off_night = stats["fixed_off_night"]
@@ -288,7 +665,17 @@ def diagnose_infeasibility(workers: List[Worker], num_days: int, cfg: dict) -> s
         if combined_possible < combined_needed:
             day_reasons.append(f"주간+야간+비번 최소 {combined_needed}명 중 최대 {combined_possible}명만 가능")
 
-        if day_reasons:
+        if day_reasons and not _daily_to_violation_is_user_forced(
+            workers,
+            [_collect_forced_assignments(worker, num_days) for worker in workers],
+            num_days,
+            d,
+            min_d,
+            max(len(workers), min_d),
+            min_n,
+            max(len(workers), min_n),
+            allow_user_forced_rule_violations,
+        ):
             reasons.append(
                 f"● {d+1}일: {basis_label} 기준으로 {', '.join(day_reasons)}합니다. "
                 f"{_unavailable_summary(stats['unavailable'])} "
@@ -307,12 +694,16 @@ def diagnose_infeasibility(workers: List[Worker], num_days: int, cfg: dict) -> s
             current = forced.get(d)
             next_shift = forced.get(d + 1)
             if current == SHIFT_NIGHT and next_shift is not None and next_shift != SHIFT_OFF_NIGHT:
+                if allow_user_forced_rule_violations and _is_forced_double_night_start(forced, d):
+                    continue
                 reasons.append(
                     f"● {worker_label}: {d+1}일 야간 다음 {d+2}일은 비번이어야 하는데 "
                     f"{_shift_label(next_shift)}이 지정되었습니다."
                 )
 
             if current == SHIFT_OFF_NIGHT and next_shift is not None:
+                if allow_user_forced_rule_violations and forced.get(d + 1) is not None:
+                    continue
                 allowed_next = {SHIFT_OFF}
                 if allow_leave_after_off_night:
                     allowed_next.add(SHIFT_LEAVE)
@@ -341,11 +732,11 @@ def diagnose_infeasibility(workers: List[Worker], num_days: int, cfg: dict) -> s
         
         # 전담 근무자 고정 근무 충돌 체크
         dedicated_shift = _worker_dedicated_shift(w)
-        if dedicated_shift == "day":
+        if dedicated_shift == "day" and not allow_user_forced_rule_violations:
             for d, val in forced.items():
                 if val in (SHIFT_NIGHT, SHIFT_OFF_NIGHT):
                     reasons.append(f"● {worker_label}: 주간 전담인데 {d+1}일에 야간/비번 근무가 지정되었습니다.")
-        elif dedicated_shift == "night":
+        elif dedicated_shift == "night" and not allow_user_forced_rule_violations:
             for d, val in forced.items():
                 if val == SHIFT_DAY:
                     reasons.append(f"● {worker_label}: 야간 전담인데 {d+1}일에 주간 근무가 지정되었습니다.")
@@ -369,7 +760,13 @@ def _diagnostic_min_staffing(cfg: dict) -> tuple[int, int]:
     return int(cfg["allow_min_d"]), int(cfg["allow_min_n"])
 
 
-def _daily_capacity_stats(workers: List[Worker], num_days: int, day: int) -> dict[str, object]:
+def _daily_capacity_stats(
+	workers: List[Worker],
+	num_days: int,
+	day: int,
+	allow_user_forced_rule_violations: bool = False,
+	forced_by_worker: List[Dict[int, int | str]] | None = None,
+) -> dict[str, object]:
     stats = {
         "fixed_day": 0,
         "fixed_night": 0,
@@ -382,7 +779,7 @@ def _daily_capacity_stats(workers: List[Worker], num_days: int, day: int) -> dic
 
     for index, worker in enumerate(workers):
         label = worker.name or f"근무자{index + 1}"
-        forced = _collect_forced_assignments(worker, num_days)
+        forced = forced_by_worker[index] if forced_by_worker is not None else _collect_forced_assignments(worker, num_days)
         current = forced.get(day)
         previous = forced.get(day - 1) if day > 0 else None
 
@@ -390,7 +787,11 @@ def _daily_capacity_stats(workers: List[Worker], num_days: int, day: int) -> dic
             stats["unavailable"].append(f"{label}(기간 외)")
             continue
 
-        forced_off_night = (day == 0 and worker.prev_month_last_day_night) or previous == SHIFT_NIGHT
+        forced_off_night = (day == 0 and worker.prev_month_last_day_night) or _previous_night_requires_off_night(
+            forced,
+            day,
+            allow_user_forced_rule_violations,
+        )
         forced_off_after_off_night = (
             day == 1 and worker.prev_month_last_day_night
         ) or previous == SHIFT_OFF_NIGHT
@@ -424,6 +825,41 @@ def _daily_capacity_stats(workers: List[Worker], num_days: int, day: int) -> dic
             stats["both"] += 1
 
     return stats
+
+
+def _daily_to_violation_is_user_forced(
+	workers: List[Worker],
+	forced_by_worker: List[Dict[int, int | str]],
+	num_days: int,
+	day: int,
+	min_day: int,
+	max_day: int,
+	min_night: int,
+	max_night: int,
+	allow_user_forced_rule_violations: bool,
+) -> bool:
+	if not allow_user_forced_rule_violations:
+		return False
+	if not any(forced.get(day) is not None for forced in forced_by_worker):
+		return False
+
+	stats = _daily_capacity_stats(
+		workers,
+		num_days,
+		day,
+		allow_user_forced_rule_violations,
+		forced_by_worker,
+	)
+	fixed_day = int(stats["fixed_day"])
+	fixed_night = int(stats["fixed_night"])
+	day_possible = fixed_day + int(stats["day_only"]) + int(stats["both"])
+	night_possible = fixed_night + int(stats["night_only"]) + int(stats["both"])
+	return (
+		fixed_day > max_day
+		or fixed_night > max_night
+		or day_possible < min_day
+		or night_possible < min_night
+	)
 
 
 def _required_off_night_for_day(workers: List[Worker], num_days: int, day: int, min_night: int) -> int:
@@ -498,6 +934,7 @@ def _validate_solve_inputs(workers: List[Worker], num_days: int, cfg: dict) -> N
 def _attempt_plans(cfg: dict) -> List[dict[str, bool]]:
 	allow_double = bool(cfg.get("allow_double_night_cycle", False))
 	use_emergency = bool(cfg.get("use_emergency_range", False))
+	penalties = _penalty_values_from_cfg(cfg)
 	plans: List[dict[str, bool]] = []
 
 	for allow_emergency_range in ([False, True] if use_emergency else [False]):
@@ -511,6 +948,16 @@ def _attempt_plans(cfg: dict) -> List[dict[str, bool]]:
 					}
 				)
 
+	plans.sort(
+		key=lambda plan: (
+			(int(plan["allow_emergency_range"]) * penalties[PENALTY_KEY_EMERGENCY])
+			+ (int(plan["allow_auto_five_off_streaks"]) * penalties[PENALTY_KEY_FIVE_REST])
+			+ (int(plan["allow_double_night_cycle"]) * penalties[PENALTY_KEY_DOUBLE_NIGHT]),
+			int(plan["allow_emergency_range"]),
+			int(plan["allow_auto_five_off_streaks"]),
+			int(plan["allow_double_night_cycle"]),
+		)
+	)
 	return plans
 
 
@@ -620,6 +1067,10 @@ def _solve_schedule_attempt(
 	use_preference = cfg["use_preference"]
 	allow_leave_after_off_night = cfg["allow_leave_after_off_night"]
 	use_double_night_cycle = bool(allow_double_night_cycle and cfg["allow_double_night_cycle"])
+	max_consecutive_day = cfg["max_consecutive_day"]
+	max_consecutive_rest = cfg["max_consecutive_rest"]
+	allow_user_forced_rule_violations = bool(cfg.get("allow_user_forced_rule_violations", False))
+	penalties = _penalty_values_from_cfg(cfg)
 	repair_context = repair_context or {}
 	baseline_schedule = repair_context.get("baseline_schedule")
 	locked_assignments: Dict[Tuple[int, int], int | str] = dict(
@@ -635,6 +1086,8 @@ def _solve_schedule_attempt(
 
 	for worker in workers:
 		forced = _collect_forced_assignments(worker, num_days)
+		if allow_user_forced_rule_violations:
+			_validate_user_forced_override_patterns(worker, forced, num_days)
 		w_idx = len(forced_by_worker)
 		for (locked_worker, locked_day), locked_value in locked_assignments.items():
 			if locked_worker != w_idx:
@@ -697,11 +1150,21 @@ def _solve_schedule_attempt(
 					model.Add(x[w_idx, d, SHIFT_LEAVE] == 0)
 
 			dedicated_shift = _worker_dedicated_shift(worker)
+			dedicated_override = (
+				allow_user_forced_rule_violations
+				and isinstance(forced_value, int)
+				and (
+					(dedicated_shift == "day" and forced_value in (SHIFT_NIGHT, SHIFT_OFF_NIGHT))
+					or (dedicated_shift == "night" and forced_value == SHIFT_DAY)
+				)
+			)
 			if dedicated_shift == "day":
-				model.Add(x[w_idx, d, SHIFT_NIGHT] == 0)
-				model.Add(x[w_idx, d, SHIFT_OFF_NIGHT] == 0)
+				if not dedicated_override:
+					model.Add(x[w_idx, d, SHIFT_NIGHT] == 0)
+					model.Add(x[w_idx, d, SHIFT_OFF_NIGHT] == 0)
 			elif dedicated_shift == "night":
-				model.Add(x[w_idx, d, SHIFT_DAY] == 0)
+				if not dedicated_override:
+					model.Add(x[w_idx, d, SHIFT_DAY] == 0)
 
 		if worker.prev_month_last_day_night:
 			if isinstance(forced.get(0), str):
@@ -721,12 +1184,25 @@ def _solve_schedule_attempt(
 				model.Add(x[w_idx, 0, SHIFT_OFF_NIGHT] == 0)
 
 		for d in range(num_days - 1):
+			if allow_user_forced_rule_violations and _is_forced_double_night_start(forced, d):
+				continue
+			if allow_user_forced_rule_violations and _is_forced_double_night_second(forced, d):
+				if d + 1 >= num_days:
+					raise SchedulerError(f"{worker.name or f'근무자{w_idx + 1}'}: 야간 2연속 뒤에는 휴무가 필요합니다.")
+				model.Add(x[w_idx, d + 1, SHIFT_OFF] == 1)
+				continue
 			model.AddBoolOr([
 				x[w_idx, d, SHIFT_NIGHT].Not(),
 				x[w_idx, d + 1, SHIFT_OFF_NIGHT],
 			])
 
 		for d in range(num_days - 1):
+			if (
+				allow_user_forced_rule_violations
+				and forced.get(d) == SHIFT_OFF_NIGHT
+				and forced.get(d + 1) is not None
+			):
+				continue
 			allowed_after_off_night = [x[w_idx, d + 1, SHIFT_OFF]]
 			if allow_leave_after_off_night:
 				allowed_after_off_night.append(x[w_idx, d + 1, SHIFT_LEAVE])
@@ -761,11 +1237,6 @@ def _solve_schedule_attempt(
 				x[w_idx, d - 1, SHIFT_NIGHT],
 			])
 
-		for start in range(0, max(0, num_days - 5)):
-			model.Add(
-				sum(x[w_idx, day, SHIFT_DAY] for day in range(start, start + 6)) <= 5
-			)
-
 	day_counts = []
 	night_counts = []
 	emergency_used_by_day = []
@@ -775,25 +1246,69 @@ def _solve_schedule_attempt(
 
 		if use_emergency_range:
 			emergency_used = model.NewBoolVar(f"emergency_used_d{d}")
-			model.Add(day_cnt >= allow_min_d).OnlyEnforceIf(emergency_used.Not())
-			model.Add(day_cnt <= allow_max_d).OnlyEnforceIf(emergency_used.Not())
-			model.Add(night_cnt >= allow_min_n).OnlyEnforceIf(emergency_used.Not())
-			model.Add(night_cnt <= allow_max_n).OnlyEnforceIf(emergency_used.Not())
-			model.Add(day_cnt >= em_min_d).OnlyEnforceIf(emergency_used)
-			model.Add(day_cnt <= em_max_d).OnlyEnforceIf(emergency_used)
-			model.Add(night_cnt >= em_min_n).OnlyEnforceIf(emergency_used)
-			model.Add(night_cnt <= em_max_n).OnlyEnforceIf(emergency_used)
+			if not _daily_to_violation_is_user_forced(
+				workers,
+				forced_by_worker,
+				num_days,
+				d,
+				allow_min_d if not allow_emergency_range else em_min_d,
+				allow_max_d if not allow_emergency_range else em_max_d,
+				allow_min_n if not allow_emergency_range else em_min_n,
+				allow_max_n if not allow_emergency_range else em_max_n,
+				allow_user_forced_rule_violations,
+			):
+				model.Add(day_cnt >= allow_min_d).OnlyEnforceIf(emergency_used.Not())
+				model.Add(day_cnt <= allow_max_d).OnlyEnforceIf(emergency_used.Not())
+				model.Add(night_cnt >= allow_min_n).OnlyEnforceIf(emergency_used.Not())
+				model.Add(night_cnt <= allow_max_n).OnlyEnforceIf(emergency_used.Not())
+				model.Add(day_cnt >= em_min_d).OnlyEnforceIf(emergency_used)
+				model.Add(day_cnt <= em_max_d).OnlyEnforceIf(emergency_used)
+				model.Add(night_cnt >= em_min_n).OnlyEnforceIf(emergency_used)
+				model.Add(night_cnt <= em_max_n).OnlyEnforceIf(emergency_used)
 			emergency_used_by_day.append(emergency_used)
 		else:
-			model.Add(day_cnt >= allow_min_d)
-			model.Add(day_cnt <= allow_max_d)
-			model.Add(night_cnt >= allow_min_n)
-			model.Add(night_cnt <= allow_max_n)
+			if not _daily_to_violation_is_user_forced(
+				workers,
+				forced_by_worker,
+				num_days,
+				d,
+				allow_min_d,
+				allow_max_d,
+				allow_min_n,
+				allow_max_n,
+				allow_user_forced_rule_violations,
+			):
+				model.Add(day_cnt >= allow_min_d)
+				model.Add(day_cnt <= allow_max_d)
+				model.Add(night_cnt >= allow_min_n)
+				model.Add(night_cnt <= allow_max_n)
 
 		day_counts.append(day_cnt)
 		night_counts.append(night_cnt)
 
 	objective_terms = []
+
+	_add_day_streak_policy(
+		model,
+		x,
+		workers,
+		forced_by_worker,
+		num_days,
+		objective_terms,
+		max_consecutive_day,
+		penalties[PENALTY_KEY_DAY_STREAK],
+		allow_user_forced_rule_violations,
+	)
+
+	_add_day_rest_shape_policy(
+		model,
+		x,
+		workers,
+		num_days,
+		objective_terms,
+		max_consecutive_day,
+		em_max_n if use_emergency_range else allow_max_n,
+	)
 
 	_add_rest_streak_policy(
 		model,
@@ -803,6 +1318,8 @@ def _solve_schedule_attempt(
 		num_days,
 		objective_terms,
 		allow_auto_five_off_streaks,
+		max_consecutive_rest,
+		penalties[PENALTY_KEY_FIVE_REST],
 	)
 
 	if baseline_schedule is not None:
@@ -820,11 +1337,11 @@ def _solve_schedule_attempt(
 
 	if use_emergency_range:
 		for emergency_used in emergency_used_by_day:
-			objective_terms.append(emergency_used * EMERGENCY_DAY_PENALTY)
+			objective_terms.append(emergency_used * penalties[PENALTY_KEY_EMERGENCY])
 
 	if use_double_night_cycle:
 		for _w_idx, _day, double_cycle in double_night_cycle_vars:
-			objective_terms.append(double_cycle * DOUBLE_NIGHT_CYCLE_PENALTY)
+			objective_terms.append(double_cycle * penalties[PENALTY_KEY_DOUBLE_NIGHT])
 
 	for d in range(num_days):
 		day_dev = model.NewIntVar(0, len(workers), f"day_dev_{d}")
@@ -905,6 +1422,18 @@ def _solve_schedule_attempt(
 					break
 			row.append(assigned)
 		schedule.append(row)
+
+	invalid_night_after_day_streak = _find_night_after_max_day_streak(
+		schedule,
+		workers,
+		max_consecutive_day,
+	)
+	if invalid_night_after_day_streak is not None:
+		w_idx, start = invalid_night_after_day_streak
+		label = workers[w_idx].name or f"근무자{w_idx + 1}"
+		raise SchedulerError(
+			f"{label}: {start + 1}일부터 {max_consecutive_day}일 연속 주간 뒤 야간이 배정되어 규칙에 위배됩니다."
+		)
 
 	status_str = "OPTIMAL" if status == cp_model.OPTIMAL else "FEASIBLE"
 	info: dict[str, Any] = {

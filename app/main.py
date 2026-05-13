@@ -321,6 +321,15 @@ def _settings_from_dict(data: dict[str, Any]) -> ScheduleSettings:
         use_preference=bool(data.get("use_preference", False)),
         allow_leave_after_off_night=bool(data.get("allow_leave_after_off_night", False)),
         allow_double_night_cycle=bool(data.get("allow_double_night_cycle", False)),
+        use_advanced_settings=bool(data.get("use_advanced_settings", False)),
+        max_consecutive_day=max(1, min(31, _optional_int(data.get("max_consecutive_day"), 5) or 5)),
+        max_consecutive_rest=max(1, min(31, _optional_int(data.get("max_consecutive_rest"), 4) or 4)),
+        allow_user_forced_rule_violations=bool(data.get("allow_user_forced_rule_violations", False)),
+        penalty_order=[
+            str(value)
+            for value in (data.get("penalty_order") or [])
+            if str(value).strip()
+        ],
         special_shifts=special_shifts,
     )
 

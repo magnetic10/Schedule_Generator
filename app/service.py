@@ -3,6 +3,7 @@
 import calendar
 import datetime
 import math
+import os
 import re
 from dataclasses import replace
 from pathlib import Path
@@ -24,6 +25,7 @@ from core.data_io import (
     HEADER_KEYWORDS,
     analyze_template_v3,
     export_to_excel,
+    export_to_excel_openpyxl,
     is_actual_worker_name,
 )
 from core.models import Worker
@@ -136,6 +138,12 @@ def build_solver_config(req: ScheduleRequest) -> dict:
         "use_preference": settings.use_preference,
         "allow_leave_after_off_night": settings.allow_leave_after_off_night,
         "allow_double_night_cycle": settings.allow_double_night_cycle,
+        "max_consecutive_day": settings.max_consecutive_day if settings.use_advanced_settings else 5,
+        "max_consecutive_rest": settings.max_consecutive_rest if settings.use_advanced_settings else 4,
+        "allow_user_forced_rule_violations": (
+            settings.allow_user_forced_rule_violations if settings.use_advanced_settings else False
+        ),
+        "penalty_order": settings.penalty_order if settings.use_advanced_settings else [],
     }
 
     if settings.use_emergency_range:
@@ -482,11 +490,12 @@ def _build_repair_locks(
 
         shift = _shift_input_to_solver_value(edit.shift, req.settings.special_shifts)
         dedicated_shift = _dedicated_shift_from_input(worker)
-        if dedicated_shift == "day" and shift in (SHIFT_NIGHT, SHIFT_OFF_NIGHT):
+        allow_forced_override = _allow_user_forced_rule_violations(req.settings)
+        if not allow_forced_override and dedicated_shift == "day" and shift in (SHIFT_NIGHT, SHIFT_OFF_NIGHT):
             raise SchedulerError(
                 f"{display_worker_name(worker.name, worker_index)}: 주간 전담 근무자는 {day_number}일을 야간/비번으로 부분 편집할 수 없습니다."
             )
-        if dedicated_shift == "night" and shift == SHIFT_DAY:
+        if not allow_forced_override and dedicated_shift == "night" and shift == SHIFT_DAY:
             raise SchedulerError(
                 f"{display_worker_name(worker.name, worker_index)}: 야간 전담 근무자는 {day_number}일을 주간으로 부분 편집할 수 없습니다."
             )
@@ -623,9 +632,20 @@ def build_leave_need_guide(req: ScheduleRequest) -> LeaveNeedGuide:
 
 
 def _validate_pre_solver_conditions(req: ScheduleRequest, days_in_month: int) -> None:
+    _validate_target_hours_unit(req)
     _validate_target_hours_within_work_period(req, days_in_month)
     _validate_consecutive_day_work_limits(req, days_in_month)
     _validate_daily_staffing_capacity(req, days_in_month)
+
+
+def _validate_target_hours_unit(req: ScheduleRequest) -> None:
+    for index, worker in enumerate(req.workers):
+        target_hours = 160 if worker.target_hours is None else int(worker.target_hours)
+        if target_hours % 8 != 0:
+            label = display_worker_name(worker.name, index)
+            raise SchedulerError(
+                f"근무시간 설정 오류: {label}의 목표시간 {target_hours}시간은 8시간 단위로 입력해야 합니다."
+            )
 
 
 def _validate_target_hours_within_work_period(req: ScheduleRequest, days_in_month: int) -> None:
@@ -759,13 +779,37 @@ def _worker_max_credit_hours(
 
 
 def _validate_consecutive_day_work_limits(req: ScheduleRequest, days_in_month: int) -> None:
-    max_allowed = 5
+    max_allowed = max(1, min(days_in_month, int(req.settings.max_consecutive_day or 5)))
+    allow_forced_override = _allow_user_forced_rule_violations(req.settings)
     for index, worker in enumerate(req.workers):
         day_work_days = _implied_day_work_days(worker, days_in_month, req.settings)
-        longest = _longest_consecutive_run(day_work_days)
+        longest = _longest_disallowed_day_run(worker, day_work_days, max_allowed, allow_forced_override)
         if longest > max_allowed:
             label = _rule_worker_label(worker, index)
             raise SchedulerError(f"{label}: 주간 연속 일수가 {longest}일로 규칙에 위배됩니다.")
+
+
+def _allow_user_forced_rule_violations(settings: ScheduleSettings) -> bool:
+    return bool(settings.use_advanced_settings and settings.allow_user_forced_rule_violations)
+
+
+def _longest_disallowed_day_run(
+    worker: WorkerInput,
+    day_work_days: set[int],
+    max_allowed: int,
+    allow_forced_override: bool,
+) -> int:
+    longest = 0
+    for start, end in _consecutive_runs(day_work_days):
+        length = end - start + 1
+        if allow_forced_override and length > max_allowed and _all_fixed_day(worker, start, end):
+            continue
+        longest = max(longest, length)
+    return longest
+
+
+def _all_fixed_day(worker: WorkerInput, start_day: int, end_day: int) -> bool:
+    return all(_fixed_shift_for_day(worker, day) == "day" for day in range(start_day, end_day + 1))
 
 
 def _implied_day_work_days(
@@ -913,6 +957,7 @@ def _validate_daily_staffing_capacity(req: ScheduleRequest, days_in_month: int) 
     if min_day <= 0 and min_night <= 0:
         return
 
+    allow_forced_override = _allow_user_forced_rule_violations(req.settings)
     reasons: list[str] = []
     for day in range(1, days_in_month + 1):
         stats = _daily_staffing_capacity(req, day, days_in_month)
@@ -952,6 +997,8 @@ def _validate_daily_staffing_capacity(req: ScheduleRequest, days_in_month: int) 
 
         if not day_reasons:
             continue
+        if allow_forced_override and _daily_to_shortage_is_user_forced(req, day, stats, min_day, min_night):
+            continue
 
         unavailable_text = _daily_unavailable_summary(stats)
         reasons.append(
@@ -963,6 +1010,21 @@ def _validate_daily_staffing_capacity(req: ScheduleRequest, days_in_month: int) 
 
     if reasons:
         raise SchedulerError("날짜별 최소 인원을 채울 수 없습니다.\n" + "\n".join(reasons))
+
+
+def _daily_to_shortage_is_user_forced(
+    req: ScheduleRequest,
+    day: int,
+    stats: dict[str, object],
+    min_day: int,
+    min_night: int,
+) -> bool:
+    has_user_fixed = any(_fixed_shift_for_day(worker, day) for worker in req.workers)
+    if not has_user_fixed:
+        return False
+    day_possible = int(stats.get("fixed_day", 0)) + int(stats.get("day_only", 0)) + int(stats.get("both", 0))
+    night_possible = int(stats.get("fixed_night", 0)) + int(stats.get("night_only", 0)) + int(stats.get("both", 0))
+    return day_possible < min_day or night_possible < min_night
 
 
 def _effective_min_staffing(settings: ScheduleSettings) -> tuple[int, int, str]:
@@ -994,7 +1056,11 @@ def _daily_staffing_capacity(req: ScheduleRequest, day: int, days_in_month: int)
 
         shift = _fixed_shift_for_day(worker, day)
         previous_shift = _fixed_shift_for_day(worker, day - 1) if day > 1 else ""
-        forced_off_night = (day == 1 and worker.prev_month_last_day_night) or previous_shift == "night"
+        forced_off_night = (day == 1 and worker.prev_month_last_day_night) or _previous_input_night_requires_off_night(
+            worker,
+            day,
+            req.settings,
+        )
 
         if shift == "day":
             stats["fixed_day"] += 1
@@ -1025,6 +1091,22 @@ def _daily_staffing_capacity(req: ScheduleRequest, day: int, days_in_month: int)
             stats["both"] += 1
 
     return stats
+
+
+def _previous_input_night_requires_off_night(
+    worker: WorkerInput,
+    day: int,
+    settings: ScheduleSettings,
+) -> bool:
+    if day <= 1 or _fixed_shift_for_day(worker, day - 1) != "night":
+        return False
+    if (
+        _allow_user_forced_rule_violations(settings)
+        and day >= 3
+        and _fixed_shift_for_day(worker, day - 2) == "night"
+    ):
+        return False
+    return True
 
 
 def _required_off_night_for_day(
@@ -1119,7 +1201,7 @@ def export_schedule_result_to_excel(
     workers = [Worker(id=idx, name=row.name) for idx, row in enumerate(result.rows)]
     schedule = [list(row.raw_days) for row in result.rows]
 
-    export_to_excel(
+    _export_schedule_with_selected_engine(
         template_path=template_path,
         output_path=output_path,
         workers=workers,
@@ -1136,6 +1218,107 @@ def export_schedule_result_to_excel(
         worker_count=len(workers),
         days_in_month=result.days_in_month,
     )
+
+
+def _export_schedule_with_selected_engine(
+    *,
+    template_path: str,
+    output_path: str,
+    workers: list[Worker],
+    schedule: list[list[int | str]],
+    num_days: int,
+    year: int,
+    month: int,
+    apply_shift_colors: bool,
+) -> None:
+    engine = os.environ.get("WORK_SCHEDULER_EXCEL_ENGINE", "openpyxl").strip().lower()
+    if engine in {"openpyxl", "python", "server"}:
+        export_to_excel_openpyxl(
+            template_path=template_path,
+            output_path=output_path,
+            workers=workers,
+            schedule=schedule,
+            num_days=num_days,
+            year=year,
+            month=month,
+            apply_shift_colors=apply_shift_colors,
+        )
+        return
+
+    if engine in {"xlwings", "excel", "com"}:
+        export_to_excel(
+            template_path=template_path,
+            output_path=output_path,
+            workers=workers,
+            schedule=schedule,
+            num_days=num_days,
+            year=year,
+            month=month,
+            apply_shift_colors=apply_shift_colors,
+        )
+        return
+
+    if engine and engine != "auto":
+        raise ValueError(
+            "지원하지 않는 엑셀 내보내기 엔진입니다. "
+            "WORK_SCHEDULER_EXCEL_ENGINE 값은 auto, xlwings, openpyxl 중 하나여야 합니다."
+        )
+
+    if os.name != "nt":
+        export_to_excel_openpyxl(
+            template_path=template_path,
+            output_path=output_path,
+            workers=workers,
+            schedule=schedule,
+            num_days=num_days,
+            year=year,
+            month=month,
+            apply_shift_colors=apply_shift_colors,
+        )
+        return
+
+    try:
+        export_to_excel(
+            template_path=template_path,
+            output_path=output_path,
+            workers=workers,
+            schedule=schedule,
+            num_days=num_days,
+            year=year,
+            month=month,
+            apply_shift_colors=apply_shift_colors,
+        )
+    except Exception as exc:
+        if not _looks_like_excel_engine_unavailable(exc):
+            raise
+        export_to_excel_openpyxl(
+            template_path=template_path,
+            output_path=output_path,
+            workers=workers,
+            schedule=schedule,
+            num_days=num_days,
+            year=year,
+            month=month,
+            apply_shift_colors=apply_shift_colors,
+        )
+
+
+def _looks_like_excel_engine_unavailable(exc: Exception) -> bool:
+    text = str(exc).lower()
+    keywords = (
+        "excel",
+        "xlwings",
+        "com",
+        "dispatch",
+        "pywintypes",
+        "microsoft",
+        "active x",
+        "activex",
+        "class not registered",
+        "등록",
+        "설치",
+    )
+    return any(keyword in text for keyword in keywords)
 
 
 def default_excel_filename(year: int, month: int) -> str:

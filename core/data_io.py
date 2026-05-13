@@ -867,6 +867,29 @@ def _shift_formula_row(formula: str, old_last_row: int, new_last_row: int) -> st
     return re.sub(r':([A-Z]+)(\d+)', replacer, formula)
 
 
+def _shift_formula_col(formula: str, old_last_col: int, new_last_col: int) -> str:
+    old_col = get_column_letter(old_last_col)
+    new_col = get_column_letter(new_last_col)
+
+    def replacer(m):
+        col = m.group(1)
+        row = int(m.group(2))
+        if col == old_col:
+            return f":{new_col}{row}"
+        return m.group(0)
+
+    return re.sub(r':([A-Z]+)(\d+)', replacer, formula)
+
+
+def _shift_formula_date_range_end(ws, old_last_col: int, new_last_col: int) -> None:
+    if old_last_col == new_last_col:
+        return
+    for row in ws.iter_rows():
+        for cell in row:
+            if isinstance(cell.value, str) and cell.value.startswith("="):
+                cell.value = _shift_formula_col(cell.value, old_last_col, new_last_col)
+
+
 def _apply_shift_colors_to_output_excel(
     output_path: str,
     workers: list[Worker],
@@ -1149,6 +1172,317 @@ def _finalize_basic_template_layout(
 # ───────────────────────────────────────────────
 # 엑셀 지능형 출력 (핵심 함수)
 # ───────────────────────────────────────────────
+def _unmerge_ranges_openpyxl(ws, ranges: list[tuple[int, int, int, int]]) -> None:
+    for min_row, min_col, max_row, max_col in ranges:
+        if min_row == max_row and min_col == max_col:
+            continue
+        try:
+            ws.unmerge_cells(
+                start_row=min_row,
+                start_column=min_col,
+                end_row=max_row,
+                end_column=max_col,
+            )
+        except ValueError:
+            pass
+
+
+def _remerge_ranges_openpyxl(ws, ranges: list[tuple[int, int, int, int]]) -> None:
+    seen: set[str] = set()
+    for min_row, min_col, max_row, max_col in ranges:
+        if min_row == max_row and min_col == max_col:
+            continue
+        address = _range_address(min_row, min_col, max_row, max_col)
+        if address in seen:
+            continue
+        seen.add(address)
+        try:
+            ws.merge_cells(
+                start_row=min_row,
+                start_column=min_col,
+                end_row=max_row,
+                end_column=max_col,
+            )
+        except ValueError:
+            pass
+
+
+def _translate_formula_for_cell(formula: str, source_coordinate: str, target_coordinate: str) -> str:
+    try:
+        from openpyxl.formula.translate import Translator
+
+        return Translator(formula, origin=source_coordinate).translate_formula(target_coordinate)
+    except Exception:
+        return formula
+
+
+def _copy_cell_openpyxl(ws, source_row: int, source_col: int, target_row: int, target_col: int) -> None:
+    source = ws.cell(source_row, source_col)
+    target = ws.cell(target_row, target_col)
+
+    if isinstance(source.value, str) and source.value.startswith("="):
+        target.value = _translate_formula_for_cell(source.value, source.coordinate, target.coordinate)
+    else:
+        target.value = source.value
+
+    if source.has_style:
+        target._style = copy(source._style)
+    if source.number_format:
+        target.number_format = source.number_format
+    if source.protection:
+        target.protection = copy(source.protection)
+    if source.alignment:
+        target.alignment = copy(source.alignment)
+    if source.hyperlink:
+        target._hyperlink = copy(source.hyperlink)
+    if source.comment:
+        target.comment = copy(source.comment)
+
+
+def _copy_column_openpyxl(ws, source_col: int, target_col: int, max_row: int) -> None:
+    source_letter = get_column_letter(source_col)
+    target_letter = get_column_letter(target_col)
+    if source_letter in ws.column_dimensions:
+        ws.column_dimensions[target_letter].width = ws.column_dimensions[source_letter].width
+
+    for row in range(1, max_row + 1):
+        _copy_cell_openpyxl(ws, row, source_col, row, target_col)
+
+
+def _copy_row_block_openpyxl(
+    ws,
+    source_start: int,
+    target_start: int,
+    row_count: int,
+    max_col: int,
+) -> None:
+    for offset in range(row_count):
+        source_row = source_start + offset
+        target_row = target_start + offset
+        if source_row in ws.row_dimensions:
+            ws.row_dimensions[target_row].height = ws.row_dimensions[source_row].height
+        for col in range(1, max_col + 1):
+            _copy_cell_openpyxl(ws, source_row, col, target_row, col)
+
+
+def _update_month_text(value, year: int, month: int):
+    if value is None:
+        return value
+    text = str(value)
+    updated = re.sub(r"\d{4}\s*년\s*\d{1,2}\s*월", f"{year}년 {month}월", text)
+    updated = re.sub(r"(?<!\d)\d{1,2}\s*월", f"{month}월", updated)
+    return updated
+
+
+def _force_workbook_recalculation(wb) -> None:
+    try:
+        wb.calculation.calcMode = "auto"
+        wb.calculation.fullCalcOnLoad = True
+        wb.calculation.forceFullCalc = True
+    except AttributeError:
+        pass
+
+
+def export_to_excel_openpyxl(
+    template_path: str,
+    output_path: str,
+    workers: list[Worker],
+    schedule: list[list[int]],
+    num_days: int,
+    year: int,
+    month: int,
+    apply_shift_colors: bool = False,
+) -> None:
+    """Excel 앱 없이 openpyxl만 사용해 근무표 xlsx를 생성한다."""
+    try:
+        import openpyxl
+    except ImportError as e:
+        raise ImportError(f"필요한 라이브러리가 없습니다: {e}")
+
+    if not os.path.exists(template_path):
+        raise FileNotFoundError(f"서식 파일({template_path})을 찾을 수 없습니다.")
+
+    wb = openpyxl.load_workbook(template_path, data_only=False)
+    try:
+        ws = wb.worksheets[0]
+        info = analyze_template_v3(ws)
+        merged_ranges = _read_merged_ranges(ws)
+        _unmerge_ranges_openpyxl(ws, merged_ranges)
+
+        date_row = info["date_row"]
+        day_row = info["day_row"]
+        date_col_start = info["date_col_start"]
+        name_col = info["name_col"]
+        w_row_start = info["worker_row_start"]
+        w_row_step = info["worker_row_step"]
+        w_data_offset = info["worker_data_row_offset"]
+        footer_row_org = info["footer_row"]
+        tmpl_days = info["template_days"]
+        original_template_days = tmpl_days
+        right_stat_col = info["right_stat_col_start"]
+        max_row_for_copy = max(ws.max_row, (footer_row_org or 0) + 20)
+
+        if num_days > tmpl_days:
+            original_days = tmpl_days
+            current_days = tmpl_days
+            for _ in range(num_days - tmpl_days):
+                insert_col = _middle_date_col(date_col_start, current_days)
+                source_col = max(date_col_start, insert_col - 1)
+                ws.insert_cols(insert_col)
+                _copy_column_openpyxl(ws, source_col, insert_col, max_row_for_copy)
+                merged_ranges = _adjust_merged_ranges_for_col_insert(merged_ranges, insert_col)
+                current_days += 1
+            tmpl_days = num_days
+            right_stat_col = right_stat_col + (num_days - original_days) if right_stat_col else None
+        elif num_days < tmpl_days:
+            original_days = tmpl_days
+            current_days = tmpl_days
+            for _ in range(tmpl_days - num_days):
+                col_to_del = _middle_date_col(date_col_start, current_days)
+                ws.delete_cols(col_to_del)
+                merged_ranges = _adjust_merged_ranges_for_col_delete(merged_ranges, col_to_del)
+                current_days -= 1
+            tmpl_days = num_days
+            right_stat_col = right_stat_col - (original_days - num_days) if right_stat_col else None
+
+        korean_days = ["월", "화", "수", "목", "금", "토", "일"]
+        for row, col in info["month_cells"]:
+            ws.cell(row, col).value = _update_month_text(ws.cell(row, col).value, year, month)
+
+        for day_index in range(tmpl_days):
+            col = date_col_start + day_index
+            if day_index < num_days:
+                ws.cell(date_row, col).value = day_index + 1
+                if day_row:
+                    ws.cell(day_row, col).value = korean_days[
+                        datetime.date(year, month, day_index + 1).weekday()
+                    ]
+            else:
+                ws.cell(date_row, col).value = ""
+                if day_row:
+                    ws.cell(day_row, col).value = ""
+
+        base_workers = 0
+        row = w_row_start
+        while row <= ws.max_row:
+            value = ws.cell(row, name_col).value
+            text = str(value).strip() if value else ""
+            if not text or text in FOOTER_KEYWORDS:
+                break
+            base_workers += 1
+            row += w_row_step
+        if base_workers <= 0:
+            base_workers = int(info.get("worker_row_count") or len(workers))
+
+        diff = len(workers) - base_workers
+        footer_row_new = footer_row_org + diff * w_row_step if footer_row_org else None
+        if diff > 0:
+            insert_at = _middle_worker_insert_row(w_row_start, base_workers, w_row_step)
+            source_start = max(w_row_start, insert_at - w_row_step)
+            for _ in range(diff):
+                ws.insert_rows(insert_at, amount=w_row_step)
+                _copy_row_block_openpyxl(
+                    ws,
+                    source_start=source_start,
+                    target_start=insert_at,
+                    row_count=w_row_step,
+                    max_col=ws.max_column,
+                )
+                merged_ranges = _adjust_merged_ranges_for_row_insert(
+                    merged_ranges,
+                    insert_at,
+                    w_row_step,
+                )
+                insert_at += w_row_step
+        elif diff < 0:
+            current_workers = base_workers
+            for _ in range(-diff):
+                delete_at = _middle_worker_delete_row(w_row_start, current_workers, w_row_step)
+                ws.delete_rows(delete_at, amount=w_row_step)
+                merged_ranges = _adjust_merged_ranges_for_row_delete(
+                    merged_ranges,
+                    delete_at,
+                    w_row_step,
+                )
+                current_workers -= 1
+
+        for worker_index, worker in enumerate(workers):
+            name_row = w_row_start + worker_index * w_row_step
+            data_row = name_row + w_data_offset
+            ws.cell(name_row, name_col).value = worker.name
+            for day_index in range(num_days):
+                shift_value = schedule[worker_index][day_index]
+                if isinstance(shift_value, int):
+                    ws.cell(data_row, date_col_start + day_index).value = SHIFT_TO_STR.get(
+                        shift_value,
+                        str(shift_value),
+                    )
+                else:
+                    ws.cell(data_row, date_col_start + day_index).value = shift_value
+
+        _shift_formula_date_range_end(
+            ws,
+            date_col_start + original_template_days - 1,
+            date_col_start + num_days - 1,
+        )
+
+        last_worker_row_new = w_row_start + len(workers) * w_row_step - 1
+        last_worker_data_row_new = w_row_start + (len(workers) - 1) * w_row_step + w_data_offset
+        last_worker_row_old = w_row_start + base_workers * w_row_step - 1
+        last_worker_data_row_old = w_row_start + (base_workers - 1) * w_row_step + w_data_offset
+
+        if footer_row_new and diff != 0:
+            for row in range(footer_row_new, min(ws.max_row, footer_row_new + 15) + 1):
+                for col in range(date_col_start, date_col_start + tmpl_days):
+                    cell = ws.cell(row, col)
+                    if not isinstance(cell.value, str) or not cell.value.startswith("="):
+                        continue
+                    formula = _shift_formula_row(cell.value, last_worker_row_old, last_worker_row_new)
+                    formula = _shift_formula_row(formula, last_worker_data_row_old, last_worker_data_row_new)
+                    cell.value = formula
+
+        if right_stat_col:
+            source_data_row = w_row_start + w_data_offset
+            for worker_index in range(len(workers)):
+                data_row = w_row_start + worker_index * w_row_step + w_data_offset
+                if data_row == source_data_row:
+                    continue
+                for offset in range(8):
+                    col = right_stat_col + offset
+                    source_formula = ws.cell(source_data_row, col).value
+                    if not isinstance(source_formula, str) or not source_formula.startswith("="):
+                        break
+                    _copy_cell_openpyxl(ws, source_data_row, col, data_row, col)
+
+        _remerge_ranges_openpyxl(ws, merged_ranges)
+        _force_workbook_recalculation(wb)
+        wb.save(output_path)
+    finally:
+        wb.close()
+
+    if _is_basic_template_path(template_path):
+        _finalize_basic_template_layout(
+            output_path=output_path,
+            date_row=date_row,
+            day_row=day_row,
+            date_col_start=date_col_start,
+            name_col=name_col,
+            worker_row_start=w_row_start,
+            worker_count=len(workers),
+            worker_row_step=w_row_step,
+            worker_data_row_offset=w_data_offset,
+            num_days=num_days,
+        )
+    elif diff != 0:
+        _normalize_worker_footer_separator(
+            output_path=output_path,
+            worker_row_start=w_row_start,
+            worker_count=len(workers),
+            worker_row_step=w_row_step,
+            footer_row=footer_row_new,
+        )
+
+
 def export_to_excel(template_path: str, output_path: str,
                     workers: list[Worker], schedule: list[list[int]],
                     num_days: int, year: int, month: int,
