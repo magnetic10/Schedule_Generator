@@ -124,7 +124,7 @@ class ApiTests(unittest.TestCase):
 
         self.assertTrue(data["success"])
         self.assertEqual(data["result"]["rows"][0]["raw_days"][0], 3)
-        self.assertEqual(data["result"]["repair_changed_count"], 2)
+        self.assertEqual(data["result"]["repair_changed_count"], 4)
 
     def test_upload_template_returns_recognized_workers_and_delete_keeps_api_simple(self) -> None:
         workbook_bytes = _template_workbook_bytes()

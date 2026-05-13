@@ -30,10 +30,10 @@ class _SolveAttemptInfeasible(Exception):
 		self.status = status
 
 
+EMERGENCY_DAY_PENALTY = 1_000_000_000
+FIVE_REST_STREAK_PENALTY = 100_000_000
+DOUBLE_NIGHT_CYCLE_PENALTY = 10_000_000
 REPAIR_CHANGE_PENALTY = 1_000_000
-FIVE_REST_STREAK_PENALTY = 250_000
-EMERGENCY_DAY_PENALTY = 100_000
-DOUBLE_NIGHT_CYCLE_PENALTY = 50_000
 TO_TARGET_DEVIATION_PENALTY = 5_000
 FOUR_REST_STREAK_PENALTY = 2_500
 THREE_REST_STREAK_PENALTY = 250
@@ -247,29 +247,53 @@ def _collect_forced_assignments(worker: Worker, num_days: int) -> Dict[int, int 
 
 def diagnose_infeasibility(workers: List[Worker], num_days: int, cfg: dict) -> str | None:
     """스케줄 생성이 불가능한 원인을 분석하여 설명 메시지를 반환한다."""
-    min_d, min_n = cfg["em_min_d"], cfg["em_min_n"]
+    min_d, min_n = _diagnostic_min_staffing(cfg)
+    basis_label = "예외 범위" if bool(cfg.get("use_emergency_range", False)) else "기본 범위"
     reasons = []
 
     # 1. 일자별 최소 인원 충족 여부 (가장 흔한 원인)
     for d in range(num_days):
-        available_count = 0
-        leaves_and_off = []
-        for w in workers:
-            # 근무 기간 외 인지 체크
-            is_outside = False
-            if w.start_day is not None and d < w.start_day: is_outside = True
-            if w.end_day is not None and d > w.end_day: is_outside = True
-            
-            forced = _collect_forced_assignments(w, num_days)
-            f_val = forced.get(d)
-            
-            if is_outside or f_val in [SHIFT_OFF, SHIFT_OFF_NIGHT, SHIFT_LEAVE] or isinstance(f_val, str):
-                leaves_and_off.append(w.name)
-            else:
-                available_count += 1
-        
-        if available_count < (min_d + min_n):
-            reasons.append(f"● {d+1}일: 가용 인원이 {available_count}명으로, 최소 필요 인원({min_d+min_n}명)보다 부족합니다. (휴무/연가자: {', '.join(leaves_and_off[:5])}...)")
+        stats = _daily_capacity_stats(workers, num_days, d)
+        fixed_day = stats["fixed_day"]
+        fixed_night = stats["fixed_night"]
+        fixed_off_night = stats["fixed_off_night"]
+        required_off_night = _required_off_night_for_day(workers, num_days, d, min_n)
+        day_need = max(0, min_d - fixed_day)
+        night_need = max(0, min_n - fixed_night)
+        off_night_need = max(0, required_off_night - fixed_off_night)
+        day_only = stats["day_only"]
+        night_only = stats["night_only"]
+        both = stats["both"]
+        day_possible = fixed_day + day_only + both
+        night_possible = fixed_night + night_only + both
+        off_night_possible = fixed_off_night + night_only + both
+        combined_possible = fixed_day + fixed_night + fixed_off_night + day_only + night_only + both
+        combined_needed = min_d + min_n + required_off_night
+        day_reasons = []
+
+        if day_possible < min_d:
+            day_reasons.append(f"주간 최소 {min_d}명 중 최대 {day_possible}명만 가능")
+        if night_possible < min_n:
+            day_reasons.append(f"야간 최소 {min_n}명 중 최대 {night_possible}명만 가능")
+        if off_night_possible < required_off_night:
+            day_reasons.append(f"전날 야간에 따른 비번 최소 {required_off_night}명 중 최대 {off_night_possible}명만 가능")
+        if night_need + off_night_need > night_only + both:
+            day_reasons.append(
+                f"야간/비번 필요 {night_need + off_night_need}명 중 최대 {night_only + both}명만 가능"
+            )
+        if day_need + night_need + off_night_need > day_only + night_only + both:
+            day_reasons.append(
+                f"남은 주/야/비 필요 {day_need + night_need + off_night_need}명 중 최대 {day_only + night_only + both}명만 가능"
+            )
+        if combined_possible < combined_needed:
+            day_reasons.append(f"주간+야간+비번 최소 {combined_needed}명 중 최대 {combined_possible}명만 가능")
+
+        if day_reasons:
+            reasons.append(
+                f"● {d+1}일: {basis_label} 기준으로 {', '.join(day_reasons)}합니다. "
+                f"{_unavailable_summary(stats['unavailable'])} "
+                "휴무/연가/비번/기타 근무 입력이나 기본 TO 설정을 조정해 주세요."
+            )
 
     # 2. 고정 근무 간의 규칙 위반 (사용자 입력 오류)
     for w in workers:
@@ -339,6 +363,92 @@ def diagnose_infeasibility(workers: List[Worker], num_days: int, cfg: dict) -> s
     return "\n".join(reasons) if reasons else None
 
 
+def _diagnostic_min_staffing(cfg: dict) -> tuple[int, int]:
+    if bool(cfg.get("use_emergency_range", False)):
+        return int(cfg.get("em_min_d", cfg["allow_min_d"])), int(cfg.get("em_min_n", cfg["allow_min_n"]))
+    return int(cfg["allow_min_d"]), int(cfg["allow_min_n"])
+
+
+def _daily_capacity_stats(workers: List[Worker], num_days: int, day: int) -> dict[str, object]:
+    stats = {
+        "fixed_day": 0,
+        "fixed_night": 0,
+        "fixed_off_night": 0,
+        "day_only": 0,
+        "night_only": 0,
+        "both": 0,
+        "unavailable": [],
+    }
+
+    for index, worker in enumerate(workers):
+        label = worker.name or f"근무자{index + 1}"
+        forced = _collect_forced_assignments(worker, num_days)
+        current = forced.get(day)
+        previous = forced.get(day - 1) if day > 0 else None
+
+        if not _is_worker_active_on_day(worker, day):
+            stats["unavailable"].append(f"{label}(기간 외)")
+            continue
+
+        forced_off_night = (day == 0 and worker.prev_month_last_day_night) or previous == SHIFT_NIGHT
+        forced_off_after_off_night = (
+            day == 1 and worker.prev_month_last_day_night
+        ) or previous == SHIFT_OFF_NIGHT
+
+        if current == SHIFT_DAY:
+            stats["fixed_day"] += 1
+            continue
+        if current == SHIFT_NIGHT:
+            stats["fixed_night"] += 1
+            continue
+        if current == SHIFT_OFF_NIGHT or forced_off_night:
+            stats["fixed_off_night"] += 1
+            stats["unavailable"].append(f"{label}(비번)")
+            continue
+        if current == SHIFT_OFF or forced_off_after_off_night:
+            stats["unavailable"].append(f"{label}(휴무)")
+            continue
+        if current == SHIFT_LEAVE:
+            stats["unavailable"].append(f"{label}(연가)")
+            continue
+        if isinstance(current, str):
+            stats["unavailable"].append(f"{label}(기타 근무)")
+            continue
+
+        dedicated_shift = _worker_dedicated_shift(worker)
+        if dedicated_shift == "day":
+            stats["day_only"] += 1
+        elif dedicated_shift == "night":
+            stats["night_only"] += 1
+        else:
+            stats["both"] += 1
+
+    return stats
+
+
+def _required_off_night_for_day(workers: List[Worker], num_days: int, day: int, min_night: int) -> int:
+    if day <= 0:
+        return sum(1 for worker in workers if worker.prev_month_last_day_night)
+
+    previous_day = day - 1
+    fixed_previous_night = 0
+    for worker in workers:
+        if not _is_worker_active_on_day(worker, previous_day):
+            continue
+        forced = _collect_forced_assignments(worker, num_days)
+        if forced.get(previous_day) == SHIFT_NIGHT:
+            fixed_previous_night += 1
+    return max(0, min_night, fixed_previous_night)
+
+
+def _unavailable_summary(unavailable: list[str]) -> str:
+    if not unavailable:
+        return "배치 제외 인원은 없습니다."
+    shown = ", ".join(unavailable[:5])
+    suffix = f" 외 {len(unavailable) - 5}명" if len(unavailable) > 5 else ""
+    return f"배치 제외 인원: {shown}{suffix}."
+
+
 def _raise_schedule_failure(
 	workers: List[Worker],
 	num_days: int,
@@ -385,23 +495,23 @@ def _validate_solve_inputs(workers: List[Worker], num_days: int, cfg: dict) -> N
 		raise SchedulerError("목표 인원이 허용 범위를 벗어났습니다. 기본 TO 설정을 확인해 주세요.")
 
 
-def _attempt_tiers(cfg: dict) -> List[dict[str, bool]]:
+def _attempt_plans(cfg: dict) -> List[dict[str, bool]]:
 	allow_double = bool(cfg.get("allow_double_night_cycle", False))
 	use_emergency = bool(cfg.get("use_emergency_range", False))
-	if allow_double and use_emergency:
-		return [
-			{"allow_double_night_cycle": False, "allow_emergency_range": False},
-			{"allow_double_night_cycle": True, "allow_emergency_range": False},
-			{"allow_double_night_cycle": True, "allow_emergency_range": True},
-		]
-	if allow_double:
-		return [
-			{"allow_double_night_cycle": False, "allow_emergency_range": False},
-			{"allow_double_night_cycle": True, "allow_emergency_range": False},
-		]
-	return [
-		{"allow_double_night_cycle": False, "allow_emergency_range": use_emergency},
-	]
+	plans: List[dict[str, bool]] = []
+
+	for allow_emergency_range in ([False, True] if use_emergency else [False]):
+		for allow_auto_five_off_streaks in (False, True):
+			for allow_double_night_cycle in ([False, True] if allow_double else [False]):
+				plans.append(
+					{
+						"allow_emergency_range": allow_emergency_range,
+						"allow_auto_five_off_streaks": allow_auto_five_off_streaks,
+						"allow_double_night_cycle": allow_double_night_cycle,
+					}
+				)
+
+	return plans
 
 
 def _solve_with_optional_fallback(
@@ -413,33 +523,32 @@ def _solve_with_optional_fallback(
 ) -> Tuple[List[List[int | str]], str, dict[str, Any]]:
 	first_status: int | None = None
 	last_status: int | None = None
-	for allow_auto_five_off_streaks in (False, True):
-		for tier in _attempt_tiers(cfg):
-			try:
-				schedule, status_str, info = _solve_schedule_attempt(
-					workers,
-					num_days,
-					cfg,
-					random_seed,
-					allow_auto_five_off_streaks=allow_auto_five_off_streaks,
-					allow_double_night_cycle=tier["allow_double_night_cycle"],
-					allow_emergency_range=tier["allow_emergency_range"],
-					repair_context=repair_context,
-				)
-			except _SolveAttemptInfeasible as error:
-				last_status = error.status
-				if first_status is None:
-					first_status = error.status
-				if error.status != cp_model.INFEASIBLE:
-					_raise_schedule_failure(workers, num_days, cfg, error.status)
-				continue
+	for plan in _attempt_plans(cfg):
+		try:
+			schedule, status_str, info = _solve_schedule_attempt(
+				workers,
+				num_days,
+				cfg,
+				random_seed,
+				allow_auto_five_off_streaks=plan["allow_auto_five_off_streaks"],
+				allow_double_night_cycle=plan["allow_double_night_cycle"],
+				allow_emergency_range=plan["allow_emergency_range"],
+				repair_context=repair_context,
+			)
+		except _SolveAttemptInfeasible as error:
+			last_status = error.status
+			if first_status is None:
+				first_status = error.status
+			if error.status != cp_model.INFEASIBLE:
+				_raise_schedule_failure(workers, num_days, cfg, error.status)
+			continue
 
-			info["long_off_streak_fallback_used"] = allow_auto_five_off_streaks
-			if allow_auto_five_off_streaks and first_status is not None:
-				info["first_without_long_off_status"] = _cp_status_name(first_status)
-			info["double_night_cycle_fallback_used"] = bool(tier["allow_double_night_cycle"])
-			info["emergency_range_enabled_in_attempt"] = bool(tier["allow_emergency_range"])
-			return schedule, status_str, info
+		info["long_off_streak_fallback_used"] = bool(plan["allow_auto_five_off_streaks"])
+		if plan["allow_auto_five_off_streaks"] and first_status is not None:
+			info["first_without_long_off_status"] = _cp_status_name(first_status)
+		info["double_night_cycle_fallback_used"] = bool(plan["allow_double_night_cycle"])
+		info["emergency_range_enabled_in_attempt"] = bool(plan["allow_emergency_range"])
+		return schedule, status_str, info
 
 	_raise_schedule_failure(workers, num_days, cfg, last_status or cp_model.UNKNOWN)
 

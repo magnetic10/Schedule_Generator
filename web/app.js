@@ -18,7 +18,10 @@ const STATE_FILE_FORMAT = "work-scheduler-v3-state";
 const STATE_FILE_VERSION = 2;
 const TOAST_GAP_PX = 8;
 const TOAST_EXIT_MS = 220;
-const TOAST_DUPLICATE_WINDOW_MS = 1200;
+const TOAST_DUPLICATE_WINDOW_MS = 4000;
+const TOAST_SHORT_TEXT_MAX_LENGTH = 60;
+const TOAST_SHORT_TEXT_DURATION_REDUCTION_MS = 2000;
+const TOAST_MIN_DURATION_MS = 1000;
 
 const state = {
   year: null,
@@ -44,6 +47,8 @@ const state = {
   repairEdits: {},
   guideTimer: null,
   guideRequestId: 0,
+  activeGuideErrorToast: null,
+  activeGuideErrorToastId: null,
   isUploading: false,
   isSolving: false,
   solveAbortController: null,
@@ -500,6 +505,9 @@ function handleTableChange(event) {
     renderInputTable();
   } else if (["target_hours", "start_day", "end_day"].includes(field)) {
     worker[field] = optionalInt(target.value);
+    if (event.type === "input") {
+      return;
+    }
     if (event.type === "change" && ["start_day", "end_day"].includes(field)) {
       trimWorkerFixedShiftsToWorkPeriod(worker);
       refreshWorkPeriodCells(rowIndex);
@@ -725,7 +733,10 @@ async function solveSchedule(isReroll) {
       return;
     }
     failProgressTask(progressTaskId, "생성 실패");
-    showTopToast(scheduleFailureToastMessage(error.message, guideForToast), "error", 7000);
+    showTopToast(scheduleFailureToastMessage(error.message, guideForToast), "error", 7000, {
+      key: "solve-error",
+      clearOnGuideSuccess: true,
+    });
     setStatus("생성 실패");
   } finally {
     if (state.solveAbortController === controller) {
@@ -1209,10 +1220,21 @@ async function refreshGuide() {
     });
     if (requestId !== state.guideRequestId) return;
     renderGuide(data.guide);
+    clearResolvedProblemToasts();
   } catch (error) {
     if (requestId !== state.guideRequestId) return;
     if (hasExistingGuide) {
-      showTopToast(error.message, "error", 7000);
+      const normalizedError = normalizeToastText(error.message);
+      if (state.activeGuideErrorToast !== normalizedError) {
+        if (state.activeGuideErrorToastId !== null) {
+          dismissTopToast(state.activeGuideErrorToastId);
+        }
+        state.activeGuideErrorToast = normalizedError;
+        state.activeGuideErrorToastId = showTopToast(error.message, "error", 7000, {
+          key: "guide-error",
+          clearOnGuideSuccess: true,
+        });
+      }
       return;
     }
     const html = `<p class="guide-error">${escapeHtml(error.message)}</p>`;
@@ -1944,19 +1966,19 @@ function clearMessage() {
   $("messageArea").textContent = "";
 }
 
-function showTopToast(text, type = "error", durationMs = 7000) {
+function showTopToast(text, type = "error", durationMs = 7000, options = {}) {
   const normalizedText = normalizeToastText(text);
+  const adjustedDurationMs = adjustedToastDurationMs(normalizedText, durationMs);
+  const toastKey = options.key ? String(options.key) : "";
   const duplicate = state.toasts.find(
     (toast) =>
       !toast.removing &&
-      toast.type === type &&
       toast.text === normalizedText &&
       Date.now() - toast.createdAt < TOAST_DUPLICATE_WINDOW_MS,
   );
   if (duplicate) {
-    if (duplicate.timer) clearTimeout(duplicate.timer);
-    duplicate.timer = setTimeout(() => dismissTopToast(duplicate.id), durationMs);
-    return;
+    duplicate.clearOnGuideSuccess = duplicate.clearOnGuideSuccess || Boolean(options.clearOnGuideSuccess);
+    return duplicate.id;
   }
 
   const stack = ensureToastStack();
@@ -1972,6 +1994,8 @@ function showTopToast(text, type = "error", durationMs = 7000) {
     id,
     type,
     text: normalizedText,
+    key: toastKey,
+    clearOnGuideSuccess: Boolean(options.clearOnGuideSuccess),
     createdAt: Date.now(),
     element: toast,
     timer: null,
@@ -1984,11 +2008,19 @@ function showTopToast(text, type = "error", durationMs = 7000) {
     toast.classList.add("visible");
   });
 
-  item.timer = setTimeout(() => dismissTopToast(id), durationMs);
+  item.timer = setTimeout(() => dismissTopToast(id), adjustedDurationMs);
+  return id;
 }
 
 function normalizeToastText(text) {
   return String(text ?? "").replace(/\s+/g, " ").trim();
+}
+
+function adjustedToastDurationMs(text, durationMs) {
+  const baseDuration = Number(durationMs);
+  if (!Number.isFinite(baseDuration) || baseDuration <= 0) return durationMs;
+  if (Array.from(text).length > TOAST_SHORT_TEXT_MAX_LENGTH) return baseDuration;
+  return Math.max(TOAST_MIN_DURATION_MS, baseDuration - TOAST_SHORT_TEXT_DURATION_REDUCTION_MS);
 }
 
 function ensureToastStack() {
@@ -2017,6 +2049,14 @@ function dismissTopToast(id) {
     state.toasts = state.toasts.filter((toast) => toast.id !== id);
     updateToastStack();
   }, TOAST_EXIT_MS);
+}
+
+function clearResolvedProblemToasts() {
+  state.activeGuideErrorToast = null;
+  state.activeGuideErrorToastId = null;
+  state.toasts
+    .filter((toast) => toast.clearOnGuideSuccess && !toast.removing)
+    .forEach((toast) => dismissTopToast(toast.id));
 }
 
 function updateToastStack() {

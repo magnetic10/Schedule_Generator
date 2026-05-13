@@ -44,10 +44,15 @@ from core.data_io import (
 from core.models import Worker
 from core.scheduler import (
     DAY_WORKLOAD_GAP_PENALTY,
+    DOUBLE_NIGHT_CYCLE_PENALTY,
+    EMERGENCY_DAY_PENALTY,
+    FIVE_REST_STREAK_PENALTY,
     PREFERENCE_MISMATCH_PENALTY,
+    REPAIR_CHANGE_PENALTY,
     SchedulerError,
     SOLVER_MAX_TIME_SECONDS,
     TO_TARGET_DEVIATION_PENALTY,
+    _attempt_plans,
     solve_schedule,
 )
 
@@ -194,6 +199,210 @@ class ScheduleServiceTests(unittest.TestCase):
         self.assertEqual(result.rows[0].raw_days[0], SHIFT_DAY)
         self.assertEqual(result.rows[0].raw_days[1], SHIFT_OFF)
 
+    def test_leave_guide_reports_fixed_leave_exceeding_target_hours(self) -> None:
+        req = ScheduleRequest(
+            year=2026,
+            month=1,
+            workers=[
+                WorkerInput(name="A", target_hours=8, fixed_shifts={1: "leave", 2: "leave"}),
+            ],
+            settings=ScheduleSettings(
+                target_day=0,
+                target_night=0,
+                min_day=0,
+                max_day=1,
+                min_night=0,
+                max_night=1,
+            ),
+        )
+
+        with self.assertRaises(SchedulerError) as ctx:
+            build_leave_need_guide(req)
+
+        message = str(ctx.exception)
+        self.assertIn("이미 고정된 연가/근무 인정시간", message)
+        self.assertIn("목표시간 8시간보다 많습니다", message)
+
+    def test_leave_guide_reports_fixed_off_exceeding_target_capacity(self) -> None:
+        req = ScheduleRequest(
+            year=2026,
+            month=1,
+            workers=[
+                WorkerInput(name="A", start_day=1, end_day=3, target_hours=24, fixed_shifts={1: "off"}),
+            ],
+            settings=ScheduleSettings(
+                target_day=0,
+                target_night=0,
+                min_day=0,
+                max_day=1,
+                min_night=0,
+                max_night=1,
+            ),
+        )
+
+        with self.assertRaises(SchedulerError) as ctx:
+            build_leave_need_guide(req)
+
+        message = str(ctx.exception)
+        self.assertIn("주/야/비로 채울 수 있는 칸은 2개뿐", message)
+        self.assertIn("8시간 기준 3개 칸이 필요", message)
+        self.assertIn("최대 인정 가능 시간은 16시간", message)
+
+    def test_leave_guide_reports_implied_day_streak_from_target_pressure(self) -> None:
+        req = ScheduleRequest(
+            year=2026,
+            month=1,
+            workers=[
+                WorkerInput(
+                    name="A",
+                    target_hours=80,
+                    fixed_shifts={day: "off" for day in range(11, 32)},
+                ),
+            ],
+            settings=ScheduleSettings(
+                target_day=0,
+                target_night=0,
+                min_day=0,
+                max_day=1,
+                min_night=0,
+                max_night=1,
+            ),
+        )
+
+        with self.assertRaises(SchedulerError) as ctx:
+            build_leave_need_guide(req)
+
+        self.assertIn("A: 주간 연속 일수가 8일로 규칙에 위배됩니다.", str(ctx.exception))
+
+    def test_leave_guide_allows_day_streak_when_target_has_rest_slack(self) -> None:
+        req = ScheduleRequest(
+            year=2026,
+            month=1,
+            workers=[
+                WorkerInput(
+                    name="A",
+                    target_hours=72,
+                    fixed_shifts={day: "off" for day in range(11, 32)},
+                ),
+            ],
+            settings=ScheduleSettings(
+                target_day=0,
+                target_night=0,
+                min_day=0,
+                max_day=1,
+                min_night=0,
+                max_night=1,
+            ),
+        )
+
+        guide = build_leave_need_guide(req)
+
+        self.assertEqual(guide.total_target_hours, 72)
+        self.assertEqual(guide.shortage_hours, 0)
+
+    def test_leave_guide_reports_fixed_day_streak(self) -> None:
+        req = ScheduleRequest(
+            year=2026,
+            month=1,
+            workers=[
+                WorkerInput(name="A", target_hours=48, fixed_shifts={day: "day" for day in range(1, 7)}),
+            ],
+            settings=ScheduleSettings(
+                target_day=0,
+                target_night=0,
+                min_day=0,
+                max_day=1,
+                min_night=0,
+                max_night=1,
+            ),
+        )
+
+        with self.assertRaises(SchedulerError) as ctx:
+            solve_request(req)
+
+        self.assertIn("A: 주간 연속 일수가 6일로 규칙에 위배됩니다.", str(ctx.exception))
+
+    def test_leave_guide_reports_daily_staffing_shortage_from_rest_inputs(self) -> None:
+        req = ScheduleRequest(
+            year=2026,
+            month=1,
+            workers=[
+                WorkerInput(name="A", target_hours=0, fixed_shifts={1: "off"}),
+                WorkerInput(name="B", target_hours=8, fixed_shifts={1: "leave"}),
+                WorkerInput(name="C", target_hours=0),
+            ],
+            settings=ScheduleSettings(
+                target_day=1,
+                target_night=1,
+                min_day=1,
+                max_day=3,
+                min_night=1,
+                max_night=3,
+            ),
+        )
+
+        with self.assertRaises(SchedulerError) as ctx:
+            build_leave_need_guide(req)
+
+        message = str(ctx.exception)
+        self.assertIn("날짜별 최소 인원을 채울 수 없습니다", message)
+        self.assertIn("1일", message)
+        self.assertIn("남은 주/야/비 필요 2명 중 최대 1명만 가능", message)
+        self.assertIn("A(휴무)", message)
+        self.assertIn("B(연가)", message)
+
+    def test_leave_guide_counts_required_off_night_for_daily_staffing(self) -> None:
+        req = ScheduleRequest(
+            year=2026,
+            month=1,
+            workers=[
+                WorkerInput(name="A", target_hours=8, fixed_shifts={2: "off"}),
+                WorkerInput(name="B", target_hours=16),
+                WorkerInput(name="C", target_hours=16),
+            ],
+            settings=ScheduleSettings(
+                target_day=1,
+                target_night=1,
+                min_day=1,
+                max_day=2,
+                min_night=1,
+                max_night=1,
+            ),
+        )
+
+        with self.assertRaises(SchedulerError) as ctx:
+            build_leave_need_guide(req)
+
+        message = str(ctx.exception)
+        self.assertIn("2일", message)
+        self.assertIn("주간+야간+비번 최소 3명 중 최대 2명만 가능", message)
+        self.assertIn("A(휴무)", message)
+
+    def test_solver_diagnoses_daily_staffing_shortage_by_shift_type(self) -> None:
+        workers = [
+            Worker(id=1, name="A", fixed_off_days=[0], target_hours=0),
+            Worker(id=2, name="B", fixed_leave_days=[0], target_hours=8),
+            Worker(id=3, name="C", is_only_day=True, target_hours=8),
+            Worker(id=4, name="D", is_only_day=True, target_hours=8),
+        ]
+        cfg = {
+            "tgt_d": 1,
+            "tgt_n": 1,
+            "allow_min_d": 1,
+            "allow_max_d": 2,
+            "allow_min_n": 1,
+            "allow_max_n": 1,
+        }
+
+        with self.assertRaises(SchedulerError) as ctx:
+            solve_schedule(workers, 1, cfg)
+
+        message = str(ctx.exception)
+        self.assertIn("1일", message)
+        self.assertIn("야간 최소 1명 중 최대 0명만 가능", message)
+        self.assertIn("A(휴무)", message)
+        self.assertIn("B(연가)", message)
+
     def test_infeasible_fixed_night_night_reports_cycle_conflict(self) -> None:
         req = ScheduleRequest(
             year=2026,
@@ -261,6 +470,61 @@ class ScheduleServiceTests(unittest.TestCase):
         self.assertGreater(TO_TARGET_DEVIATION_PENALTY, PREFERENCE_MISMATCH_PENALTY)
         self.assertGreaterEqual(SOLVER_MAX_TIME_SECONDS, 40.0)
 
+    def test_solver_penalty_order_matches_policy(self) -> None:
+        self.assertGreater(EMERGENCY_DAY_PENALTY, FIVE_REST_STREAK_PENALTY)
+        self.assertGreater(FIVE_REST_STREAK_PENALTY, DOUBLE_NIGHT_CYCLE_PENALTY)
+        self.assertGreater(DOUBLE_NIGHT_CYCLE_PENALTY, REPAIR_CHANGE_PENALTY)
+        self.assertGreater(REPAIR_CHANGE_PENALTY, TO_TARGET_DEVIATION_PENALTY)
+
+    def test_solver_attempt_order_prefers_no_emergency_before_other_fallbacks(self) -> None:
+        plans = _attempt_plans({"allow_double_night_cycle": True, "use_emergency_range": True})
+
+        self.assertEqual(
+            plans,
+            [
+                {
+                    "allow_emergency_range": False,
+                    "allow_auto_five_off_streaks": False,
+                    "allow_double_night_cycle": False,
+                },
+                {
+                    "allow_emergency_range": False,
+                    "allow_auto_five_off_streaks": False,
+                    "allow_double_night_cycle": True,
+                },
+                {
+                    "allow_emergency_range": False,
+                    "allow_auto_five_off_streaks": True,
+                    "allow_double_night_cycle": False,
+                },
+                {
+                    "allow_emergency_range": False,
+                    "allow_auto_five_off_streaks": True,
+                    "allow_double_night_cycle": True,
+                },
+                {
+                    "allow_emergency_range": True,
+                    "allow_auto_five_off_streaks": False,
+                    "allow_double_night_cycle": False,
+                },
+                {
+                    "allow_emergency_range": True,
+                    "allow_auto_five_off_streaks": False,
+                    "allow_double_night_cycle": True,
+                },
+                {
+                    "allow_emergency_range": True,
+                    "allow_auto_five_off_streaks": True,
+                    "allow_double_night_cycle": False,
+                },
+                {
+                    "allow_emergency_range": True,
+                    "allow_auto_five_off_streaks": True,
+                    "allow_double_night_cycle": True,
+                },
+            ],
+        )
+
     def test_repair_request_preserves_user_edit_and_minimizes_changes(self) -> None:
         req = ScheduleRequest(
             year=2026,
@@ -301,7 +565,7 @@ class ScheduleServiceTests(unittest.TestCase):
 
         self.assertEqual(result.rows[0].raw_days[0], SHIFT_OFF)
         self.assertEqual(result.rows[0].raw_days.count(SHIFT_DAY), 2)
-        self.assertEqual(result.repair_changed_count, 2)
+        self.assertEqual(result.repair_changed_count, 4)
         self.assertTrue(
             any(
                 cell["worker_index"] == 0 and cell["day"] == 1 and cell["user_locked"]
@@ -1030,6 +1294,8 @@ class ScheduleServiceTests(unittest.TestCase):
                 WorkerInput(name="B", target_hours=160),
             ],
             settings=ScheduleSettings(
+                min_day=0,
+                min_night=0,
                 max_day=1,
                 max_night=0,
             ),
@@ -1052,6 +1318,10 @@ class ScheduleServiceTests(unittest.TestCase):
                 WorkerInput(name="B", target_hours=160, fixed_shifts={1: "교육"}),
             ],
             settings=ScheduleSettings(
+                target_day=0,
+                target_night=0,
+                min_day=0,
+                min_night=0,
                 max_day=1,
                 max_night=0,
                 special_shifts={"교육": 16},
@@ -1077,6 +1347,8 @@ class ScheduleServiceTests(unittest.TestCase):
             ],
             settings=ScheduleSettings(
                 max_day=0,
+                min_day=0,
+                min_night=0,
                 max_night=1,
             ),
         )
@@ -1096,6 +1368,8 @@ class ScheduleServiceTests(unittest.TestCase):
                 WorkerInput(name="B", target_hours=160),
             ],
             settings=ScheduleSettings(
+                min_day=0,
+                min_night=0,
                 max_day=1,
                 max_night=0,
                 use_emergency_range=True,

@@ -347,7 +347,7 @@ def _public_template_info(info: dict) -> dict[str, object]:
 
 def solve_request(req: ScheduleRequest) -> ScheduleResult:
     days_in_month = calendar.monthrange(req.year, req.month)[1]
-    _validate_target_hours_within_work_period(req, days_in_month)
+    _validate_pre_solver_conditions(req, days_in_month)
     workers = build_workers(req.workers, days_in_month)
     cfg = build_solver_config(req)
     schedule, status, solver_info = solve_schedule(
@@ -368,7 +368,7 @@ def solve_request(req: ScheduleRequest) -> ScheduleResult:
 
 def repair_request(req: ScheduleRepairRequest) -> ScheduleResult:
     days_in_month = calendar.monthrange(req.request.year, req.request.month)[1]
-    _validate_target_hours_within_work_period(req.request, days_in_month)
+    _validate_pre_solver_conditions(req.request, days_in_month)
     _validate_repair_shape(req, days_in_month)
 
     workers = build_workers(req.request.workers, days_in_month)
@@ -583,7 +583,7 @@ def _find_long_off_streaks(schedule: list[list[int | str]], workers: list[Worker
 
 def build_leave_need_guide(req: ScheduleRequest) -> LeaveNeedGuide:
     days_in_month = calendar.monthrange(req.year, req.month)[1]
-    _validate_target_hours_within_work_period(req, days_in_month)
+    _validate_pre_solver_conditions(req, days_in_month)
     total_target_hours = _total_target_hours(req.workers)
     leave_credit_hours, special_credit_hours = _non_to_credit_hours(req)
     non_to_credit_hours = leave_credit_hours + special_credit_hours
@@ -622,6 +622,12 @@ def build_leave_need_guide(req: ScheduleRequest) -> LeaveNeedGuide:
     )
 
 
+def _validate_pre_solver_conditions(req: ScheduleRequest, days_in_month: int) -> None:
+    _validate_target_hours_within_work_period(req, days_in_month)
+    _validate_consecutive_day_work_limits(req, days_in_month)
+    _validate_daily_staffing_capacity(req, days_in_month)
+
+
 def _validate_target_hours_within_work_period(req: ScheduleRequest, days_in_month: int) -> None:
     for index, worker in enumerate(req.workers):
         target_hours = 160 if worker.target_hours is None else int(worker.target_hours)
@@ -630,19 +636,101 @@ def _validate_target_hours_within_work_period(req: ScheduleRequest, days_in_mont
         active_start = max(1, start_day)
         active_end = min(days_in_month, end_day)
         active_days = max(0, active_end - active_start + 1)
+        min_hours = _worker_min_fixed_credit_hours(worker, days_in_month, req.settings.special_shifts)
+        assignable_credit_slots = _worker_assignable_credit_slots(worker, days_in_month)
         max_hours = _worker_max_credit_hours(worker, days_in_month, req.settings.special_shifts)
+
+        if min_hours > target_hours:
+            fixed_summary = _worker_fixed_credit_summary(worker, days_in_month, req.settings.special_shifts)
+            label = display_worker_name(worker.name, index)
+            raise SchedulerError(
+                f"{label}: 이미 고정된 연가/근무 인정시간이 {min_hours}시간으로 "
+                f"목표시간 {target_hours}시간보다 많습니다. "
+                f"현재 고정 입력은 {fixed_summary}입니다. "
+                "연가/기타 근무/고정 근무를 줄이거나 목표시간을 늘려 주세요."
+            )
 
         if target_hours <= max_hours:
             continue
 
-        required_days = math.ceil(target_hours / 8) if target_hours > 0 else 0
+        remaining_hours = max(0, target_hours - min_hours)
+        required_slots = math.ceil(remaining_hours / 8) if remaining_hours > 0 else 0
         label = display_worker_name(worker.name, index)
         raise SchedulerError(
             f"{label}: 근무 가능 기간은 {start_day}~{end_day}일, 총 {active_days}일입니다. "
-            f"현재 고정 근무를 반영한 최대 인정 가능 시간은 {max_hours}시간인데 "
-            f"목표시간 {target_hours}시간은 8시간 기준 {required_days}일이 필요해 근무 시간이 초과됩니다. "
-            "시작일/종료일을 넓히거나 목표시간, 연가, 기타 근무 입력을 조정해 주세요."
+            f"목표시간 {target_hours}시간은 근무 시간이 초과됩니다. "
+            f"고정 인정시간을 제외하고 {remaining_hours}시간을 더 채워야 하지만 "
+            f"주/야/비로 채울 수 있는 칸은 {assignable_credit_slots}개뿐입니다. "
+            f"8시간 기준 {required_slots}개 칸이 필요하므로 현재 최대 인정 가능 시간은 {max_hours}시간입니다. "
+            "시작일/종료일을 넓히거나 휴무를 줄이거나 목표시간, 연가, 기타 근무 입력을 조정해 주세요."
         )
+
+
+def _worker_min_fixed_credit_hours(
+    worker: WorkerInput,
+    days_in_month: int,
+    special_shifts: dict[str, int],
+) -> int:
+    start_day = max(1, int(worker.start_day or 1))
+    end_day = int(worker.end_day if worker.end_day is not None else days_in_month)
+    if end_day < start_day:
+        return 0
+
+    total = 0
+    for day in range(max(1, start_day), min(days_in_month, end_day) + 1):
+        shift = _fixed_shift_for_day(worker, day)
+        if shift in ("day", "night", "off_night", "leave"):
+            total += 8
+        elif shift == "off" or not shift:
+            continue
+        else:
+            token = str(shift).strip()
+            if token not in special_shifts:
+                raise SchedulerError(f"기타 근무 '{token}'의 인정 시간이 설정에 없습니다.")
+            total += int(special_shifts[token])
+    return total
+
+
+def _worker_fixed_credit_summary(
+    worker: WorkerInput,
+    days_in_month: int,
+    special_shifts: dict[str, int],
+) -> str:
+    counts = {
+        "주간": 0,
+        "야간": 0,
+        "비번": 0,
+        "연가": 0,
+        "기타 근무": 0,
+    }
+    for day in range(1, days_in_month + 1):
+        shift = _fixed_shift_for_day(worker, day)
+        if shift == "day":
+            counts["주간"] += 1
+        elif shift == "night":
+            counts["야간"] += 1
+        elif shift == "off_night":
+            counts["비번"] += 1
+        elif shift == "leave":
+            counts["연가"] += 1
+        elif shift and shift != "off":
+            token = str(shift).strip()
+            if token not in special_shifts:
+                raise SchedulerError(f"기타 근무 '{token}'의 인정 시간이 설정에 없습니다.")
+            counts["기타 근무"] += 1
+
+    parts = [f"{label} {count}일" for label, count in counts.items() if count]
+    return ", ".join(parts) if parts else "없음"
+
+
+def _worker_assignable_credit_slots(worker: WorkerInput, days_in_month: int) -> int:
+    count = 0
+    start_day = max(1, int(worker.start_day or 1))
+    end_day = int(worker.end_day if worker.end_day is not None else days_in_month)
+    for day in range(max(1, start_day), min(days_in_month, end_day) + 1):
+        if not _fixed_shift_for_day(worker, day):
+            count += 1
+    return count
 
 
 def _worker_max_credit_hours(
@@ -668,6 +756,309 @@ def _worker_max_credit_hours(
         else:
             total += 8
     return total
+
+
+def _validate_consecutive_day_work_limits(req: ScheduleRequest, days_in_month: int) -> None:
+    max_allowed = 5
+    for index, worker in enumerate(req.workers):
+        day_work_days = _implied_day_work_days(worker, days_in_month, req.settings)
+        longest = _longest_consecutive_run(day_work_days)
+        if longest > max_allowed:
+            label = _rule_worker_label(worker, index)
+            raise SchedulerError(f"{label}: 주간 연속 일수가 {longest}일로 규칙에 위배됩니다.")
+
+
+def _implied_day_work_days(
+    worker: WorkerInput,
+    days_in_month: int,
+    settings: ScheduleSettings,
+) -> set[int]:
+    day_work_days = {
+        day
+        for day in range(1, days_in_month + 1)
+        if _fixed_shift_for_day(worker, day) == "day"
+    }
+
+    if _dedicated_shift_from_input(worker) == "night" or _effective_max_day_staffing(settings) <= 0:
+        return day_work_days
+
+    target_hours = 160 if worker.target_hours is None else int(worker.target_hours)
+    fixed_credit_hours = _worker_min_fixed_credit_hours(worker, days_in_month, settings.special_shifts)
+    remaining_hours = target_hours - fixed_credit_hours
+    if remaining_hours <= 0 or remaining_hours % 8 != 0:
+        return day_work_days
+
+    assignable_days = _worker_assignable_credit_days(worker, days_in_month)
+    required_regular_days = remaining_hours // 8
+    if required_regular_days != len(assignable_days):
+        return day_work_days
+
+    for run_start, run_end in _consecutive_runs(assignable_days):
+        tail_non_day_credit_days = _credit_non_day_tail_capacity(worker, run_start, run_end, days_in_month, settings)
+        implied_day_end = run_end - tail_non_day_credit_days
+        if implied_day_end >= run_start:
+            day_work_days.update(range(run_start, implied_day_end + 1))
+
+    return day_work_days
+
+
+def _effective_max_day_staffing(settings: ScheduleSettings) -> int:
+    max_day = int(settings.max_day)
+    if settings.use_emergency_range and settings.emergency_max_day is not None:
+        max_day = max(max_day, int(settings.emergency_max_day))
+    return max_day
+
+
+def _worker_assignable_credit_days(worker: WorkerInput, days_in_month: int) -> list[int]:
+    start_day = max(1, int(worker.start_day or 1))
+    end_day = int(worker.end_day if worker.end_day is not None else days_in_month)
+    return [
+        day
+        for day in range(max(1, start_day), min(days_in_month, end_day) + 1)
+        if not _fixed_shift_for_day(worker, day)
+    ]
+
+
+def _consecutive_runs(days: Iterable[int]) -> list[tuple[int, int]]:
+    runs: list[tuple[int, int]] = []
+    start: int | None = None
+    previous: int | None = None
+    for day in sorted(days):
+        if start is None:
+            start = day
+            previous = day
+            continue
+        if previous is not None and day == previous + 1:
+            previous = day
+            continue
+        runs.append((start, previous if previous is not None else start))
+        start = day
+        previous = day
+    if start is not None:
+        runs.append((start, previous if previous is not None else start))
+    return runs
+
+
+def _credit_non_day_tail_capacity(
+    worker: WorkerInput,
+    run_start: int,
+    run_end: int,
+    days_in_month: int,
+    settings: ScheduleSettings,
+) -> int:
+    run_length = run_end - run_start + 1
+    if run_length < 2 or _dedicated_shift_from_input(worker) == "day":
+        return 0
+
+    if (
+        settings.allow_double_night_cycle
+        and run_length >= 4
+        and _can_end_run_with_double_night_cycle(worker, run_end, days_in_month, settings)
+    ):
+        return 4
+
+    if _can_end_run_with_off_night(worker, run_end, days_in_month, settings):
+        return 2
+    return 0
+
+
+def _can_end_run_with_double_night_cycle(
+    worker: WorkerInput,
+    run_end: int,
+    days_in_month: int,
+    settings: ScheduleSettings,
+) -> bool:
+    first_off_night_day = run_end - 2
+    if first_off_night_day < 2 or run_end + 2 > days_in_month:
+        return False
+    return (
+        _is_allowed_after_off_night_fixed_shift(_fixed_shift_for_day(worker, run_end + 1), settings)
+        and _is_allowed_after_off_night_fixed_shift(_fixed_shift_for_day(worker, run_end + 2), settings)
+    )
+
+
+def _can_end_run_with_off_night(
+    worker: WorkerInput,
+    run_end: int,
+    days_in_month: int,
+    settings: ScheduleSettings,
+) -> bool:
+    if run_end >= days_in_month:
+        return True
+    return _is_allowed_after_off_night_fixed_shift(_fixed_shift_for_day(worker, run_end + 1), settings)
+
+
+def _is_allowed_after_off_night_fixed_shift(shift: str, settings: ScheduleSettings) -> bool:
+    if shift == "off":
+        return True
+    return bool(settings.allow_leave_after_off_night and shift == "leave")
+
+
+def _longest_consecutive_run(days: set[int]) -> int:
+    longest = 0
+    for start, end in _consecutive_runs(days):
+        longest = max(longest, end - start + 1)
+    return longest
+
+
+def _rule_worker_label(worker: WorkerInput, index: int) -> str:
+    name = str(worker.name or "").strip()
+    if name:
+        return name
+    return display_worker_name(worker.name, index)
+
+
+def _validate_daily_staffing_capacity(req: ScheduleRequest, days_in_month: int) -> None:
+    min_day, min_night, basis_label = _effective_min_staffing(req.settings)
+    if min_day <= 0 and min_night <= 0:
+        return
+
+    reasons: list[str] = []
+    for day in range(1, days_in_month + 1):
+        stats = _daily_staffing_capacity(req, day, days_in_month)
+        fixed_day = stats["fixed_day"]
+        fixed_night = stats["fixed_night"]
+        fixed_off_night = stats["fixed_off_night"]
+        required_off_night = _required_off_night_for_day(req, day, days_in_month, min_night)
+        day_need = max(0, min_day - fixed_day)
+        night_need = max(0, min_night - fixed_night)
+        off_night_need = max(0, required_off_night - fixed_off_night)
+        day_only = stats["day_only"]
+        night_only = stats["night_only"]
+        both = stats["both"]
+        day_possible = fixed_day + day_only + both
+        night_possible = fixed_night + night_only + both
+        off_night_possible = fixed_off_night + night_only + both
+        combined_possible = fixed_day + fixed_night + fixed_off_night + day_only + night_only + both
+        combined_needed = min_day + min_night + required_off_night
+
+        day_reasons: list[str] = []
+        if day_possible < min_day:
+            day_reasons.append(f"주간 최소 {min_day}명 중 최대 {day_possible}명만 가능")
+        if night_possible < min_night:
+            day_reasons.append(f"야간 최소 {min_night}명 중 최대 {night_possible}명만 가능")
+        if off_night_possible < required_off_night:
+            day_reasons.append(f"전날 야간에 따른 비번 최소 {required_off_night}명 중 최대 {off_night_possible}명만 가능")
+        if night_need + off_night_need > night_only + both:
+            day_reasons.append(
+                f"야간/비번 필요 {night_need + off_night_need}명 중 최대 {night_only + both}명만 가능"
+            )
+        if day_need + night_need + off_night_need > day_only + night_only + both:
+            day_reasons.append(
+                f"남은 주/야/비 필요 {day_need + night_need + off_night_need}명 중 최대 {day_only + night_only + both}명만 가능"
+            )
+        if combined_possible < combined_needed:
+            day_reasons.append(f"주간+야간+비번 최소 {combined_needed}명 중 최대 {combined_possible}명만 가능")
+
+        if not day_reasons:
+            continue
+
+        unavailable_text = _daily_unavailable_summary(stats)
+        reasons.append(
+            f"{day}일: {basis_label} 기준으로 {', '.join(day_reasons)}합니다. "
+            f"{unavailable_text} 휴무/연가/비번/기타 근무 입력이나 기본 TO 설정을 조정해 주세요."
+        )
+        if len(reasons) >= 3:
+            break
+
+    if reasons:
+        raise SchedulerError("날짜별 최소 인원을 채울 수 없습니다.\n" + "\n".join(reasons))
+
+
+def _effective_min_staffing(settings: ScheduleSettings) -> tuple[int, int, str]:
+    if settings.use_emergency_range:
+        min_day = int(settings.emergency_min_day if settings.emergency_min_day is not None else settings.min_day)
+        min_night = int(settings.emergency_min_night if settings.emergency_min_night is not None else settings.min_night)
+        return min_day, min_night, "예외 범위"
+    return int(settings.min_day), int(settings.min_night), "기본 범위"
+
+
+def _daily_staffing_capacity(req: ScheduleRequest, day: int, days_in_month: int) -> dict[str, object]:
+    stats: dict[str, object] = {
+        "fixed_day": 0,
+        "fixed_night": 0,
+        "fixed_off_night": 0,
+        "day_only": 0,
+        "night_only": 0,
+        "both": 0,
+        "unavailable": [],
+    }
+
+    for index, worker in enumerate(req.workers):
+        label = display_worker_name(worker.name, index)
+        start_day = max(1, int(worker.start_day or 1))
+        end_day = int(worker.end_day if worker.end_day is not None else days_in_month)
+        if day < start_day or day > end_day:
+            stats["unavailable"].append(f"{label}(기간 외)")
+            continue
+
+        shift = _fixed_shift_for_day(worker, day)
+        previous_shift = _fixed_shift_for_day(worker, day - 1) if day > 1 else ""
+        forced_off_night = (day == 1 and worker.prev_month_last_day_night) or previous_shift == "night"
+
+        if shift == "day":
+            stats["fixed_day"] += 1
+            continue
+        if shift == "night":
+            stats["fixed_night"] += 1
+            continue
+        if shift == "off_night" or forced_off_night:
+            stats["fixed_off_night"] += 1
+            stats["unavailable"].append(f"{label}(비번)")
+            continue
+        if shift == "off":
+            stats["unavailable"].append(f"{label}(휴무)")
+            continue
+        if shift == "leave":
+            stats["unavailable"].append(f"{label}(연가)")
+            continue
+        if shift:
+            stats["unavailable"].append(f"{label}(기타 근무)")
+            continue
+
+        dedicated_shift = _dedicated_shift_from_input(worker)
+        if dedicated_shift == "day":
+            stats["day_only"] += 1
+        elif dedicated_shift == "night":
+            stats["night_only"] += 1
+        else:
+            stats["both"] += 1
+
+    return stats
+
+
+def _required_off_night_for_day(
+    req: ScheduleRequest,
+    day: int,
+    days_in_month: int,
+    min_night: int,
+) -> int:
+    if day <= 1:
+        return sum(1 for worker in req.workers if worker.prev_month_last_day_night)
+
+    previous_day = day - 1
+    fixed_previous_night = sum(
+        1
+        for worker in req.workers
+        if _fixed_shift_for_day(worker, previous_day) == "night"
+        and _is_worker_active_input_on_day(worker, previous_day, days_in_month)
+    )
+    return max(0, min_night, fixed_previous_night)
+
+
+def _is_worker_active_input_on_day(worker: WorkerInput, day: int, days_in_month: int) -> bool:
+    start_day = max(1, int(worker.start_day or 1))
+    end_day = int(worker.end_day if worker.end_day is not None else days_in_month)
+    return start_day <= day <= end_day
+
+
+def _daily_unavailable_summary(stats: dict[str, object]) -> str:
+    unavailable = list(stats.get("unavailable", []))
+    if not unavailable:
+        return "배치 제외 인원은 없습니다."
+    shown = ", ".join(str(item) for item in unavailable[:5])
+    suffix = f" 외 {len(unavailable) - 5}명" if len(unavailable) > 5 else ""
+    return f"배치 제외 인원: {shown}{suffix}."
 
 
 def _fixed_shift_for_day(worker: WorkerInput, day: int) -> str:
