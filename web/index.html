@@ -1,0 +1,202 @@
+﻿<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>근무표 생성기 V3</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/web/styles.css?v=20260513-toast-dedupe" />
+  </head>
+  <body>
+    <button id="sidebarToggleBtn" class="sidebar-toggle" type="button" aria-expanded="true" aria-controls="sidebarPanel" title="좌측 바 접기">‹</button>
+    <div class="app-shell">
+      <aside id="sidebarPanel" class="sidebar">
+        <div class="brand">
+          <div>
+            <h1>근무표 생성기</h1>
+            <p id="monthLabel">-</p>
+          </div>
+        </div>
+
+        <section class="sidebar-section">
+          <h2>엑셀 서식 불러오기</h2>
+          <label class="file-picker">
+            <input id="templateFile" type="file" accept=".xlsx" />
+            <span>파일 선택</span>
+          </label>
+          <div id="uploadProgress" class="operation-progress hidden" aria-live="polite">
+            <div class="progress-head">
+              <span id="uploadProgressLabel">엑셀 업로드 중</span>
+              <span id="uploadProgressMeta">0% · 계산 중</span>
+            </div>
+            <div class="progress-track">
+              <div id="uploadProgressBar" class="progress-fill"></div>
+            </div>
+          </div>
+          <div id="uploadInfo" class="upload-info hidden">
+            <span id="uploadName"></span>
+            <button id="removeUploadBtn" class="icon-button" type="button" title="업로드 지우기">×</button>
+          </div>
+        </section>
+
+        <section class="sidebar-section compact-grid">
+          <h2>기본 정보</h2>
+          <label>
+            <span>연도</span>
+            <input id="yearInput" type="number" min="2000" max="2100" />
+          </label>
+          <label>
+            <span>월</span>
+            <input id="monthInput" type="number" min="1" max="12" />
+          </label>
+          <label class="wide">
+            <span>월 목표 근무시간</span>
+            <input id="commonTargetInput" type="number" min="0" step="8" />
+          </label>
+        </section>
+
+        <section class="sidebar-section">
+          <h2>근무 조건</h2>
+          <label class="toggle-row"><input id="useIndividualTargets" type="checkbox" /> 개인별 목표시간 <span class="help" tabindex="0" data-tip="개인별로 목표 근무시간을 다르게 설정합니다.">?</span></label>
+          <label class="toggle-row"><input id="useDayOnly" type="checkbox" /> 전담 근무 설정 <span class="help" tabindex="0" data-tip="야간/주간 전담 근무자를 설정합니다.">?</span></label>
+          <label class="toggle-row"><input id="useWorkPeriod" type="checkbox" /> 근무 기간 설정 <span class="help" tabindex="0" data-tip="근무 시작/종료일을 설정합니다.">?</span></label>
+          <label class="toggle-row"><input id="usePreference" type="checkbox" /> 근무 선호도 반영 <span class="help" tabindex="0" data-tip="개인의 야간/주간 선호도를 반영할 수 있습니다.">?</span></label>
+          <label class="toggle-row"><input id="allowLeaveAfterOffNight" type="checkbox" /> 비번 후 연가 허용 <span class="help" tabindex="0" data-tip="연가 전날 야-비 근무를 허용합니다.">?</span></label>
+          <label class="toggle-row"><input id="allowDoubleNightCycle" type="checkbox" /> 야비야비 허용 <span class="help" tabindex="0" data-tip="해를 찾기 어려울 때 야-비-야-비-휴-휴 패턴을 허용합니다.">?</span></label>
+        </section>
+
+        <section class="sidebar-section compact-grid">
+          <h2>기본 인원 설정</h2>
+          <label><span>주간 목표</span><input id="targetDay" type="number" min="0" /></label>
+          <label><span>야간 목표</span><input id="targetNight" type="number" min="0" /></label>
+          <label><span>주간 최소</span><input id="minDay" type="number" min="0" /></label>
+          <label><span>주간 최대</span><input id="maxDay" type="number" min="0" /></label>
+          <label><span>야간 최소</span><input id="minNight" type="number" min="0" /></label>
+          <label><span>야간 최대</span><input id="maxNight" type="number" min="0" /></label>
+        </section>
+
+        <section class="sidebar-section compact-grid">
+          <h2>예외 범위 <span class="help" tabindex="0" data-tip="기본 인원 조건으로 해를 찾기 어려울 때만 최소한으로 사용되는 예외 범위입니다.">?</span></h2>
+          <label class="toggle-row wide"><input id="useEmergencyRange" type="checkbox" /> 예외 범위 사용</label>
+          <label><span>주간 최소</span><input id="emergencyMinDay" type="number" min="0" /></label>
+          <label><span>주간 최대</span><input id="emergencyMaxDay" type="number" min="0" /></label>
+          <label><span>야간 최소</span><input id="emergencyMinNight" type="number" min="0" /></label>
+          <label><span>야간 최대</span><input id="emergencyMaxNight" type="number" min="0" /></label>
+        </section>
+
+        <section class="sidebar-section">
+          <h2>특수근무 <span class="help" tabindex="0" data-tip="훈련/교육/특휴 등 특수 유형을 추가합니다.">?</span></h2>
+          <div class="special-form">
+            <input id="specialCodeInput" maxlength="1" placeholder="약어" />
+            <input id="specialHoursInput" type="number" min="0" max="24" placeholder="시간" />
+            <button id="addSpecialBtn" type="button">추가</button>
+          </div>
+          <div id="specialList" class="special-list"></div>
+        </section>
+
+        <section class="sidebar-section">
+          <label class="toggle-row"><input id="showShiftColors" type="checkbox" checked /> 근무유형 색상 표시 <span class="help" tabindex="0" data-tip="표의 근무 유형을 색으로 구분합니다.">?</span></label>
+        </section>
+
+        <button id="resetSettingsBtn" class="danger-outline" type="button">설정 초기화</button>
+      </aside>
+
+      <main class="workspace">
+        <header class="toolbar">
+          <div>
+            <h2>입력표</h2>
+            <p id="statusLine">준비 중</p>
+          </div>
+          <div class="toolbar-actions">
+            <button id="solveBtn" class="primary" type="button">근무표 생성</button>
+            <button id="resetInputBtn" type="button">입력 초기화</button>
+          </div>
+        </header>
+
+        <section id="solveProgress" class="operation-progress wide-progress floating-progress cancellable-progress hidden" aria-live="polite">
+          <div class="progress-main">
+            <div class="progress-head">
+              <span id="solveProgressLabel">근무표 생성 중</span>
+              <span id="solveProgressMeta">0% · 계산 중</span>
+            </div>
+            <div class="progress-track">
+              <div id="solveProgressBar" class="progress-fill"></div>
+            </div>
+          </div>
+          <button id="solveCancelBtn" class="progress-cancel" type="button">취소</button>
+        </section>
+
+        <section id="messageArea" class="message-area hidden"></section>
+
+        <section class="panel">
+          <div id="inputTableWrap" class="table-wrap"></div>
+          <div class="table-actions">
+            <button id="addWorkerBtn" type="button">+ 행 추가</button>
+            <span class="table-action-spacer"></span>
+            <button id="saveStateBtn" type="button">내보내기</button>
+            <button id="loadStateBtn" type="button">불러오기</button>
+            <input id="stateFileInput" type="file" accept=".json,application/json" hidden />
+          </div>
+        </section>
+
+        <section id="guidePanel" class="guide-panel hidden"></section>
+
+        <section class="result-shell">
+          <div class="result-header">
+            <div>
+              <h2>결과</h2>
+              <p id="resultMeta">생성된 결과가 없습니다.</p>
+            </div>
+            <div class="result-actions">
+              <button id="rerollBtn" type="button" disabled>다시 생성</button>
+              <button id="repairEditBtn" type="button" disabled>부분 편집</button>
+              <select id="historySelect" disabled></select>
+              <button id="repairApplyBtn" class="primary hidden" type="button">부분 재생성</button>
+              <button id="repairCancelBtn" type="button" class="hidden">취소</button>
+              <button id="downloadBtn" type="button" disabled>
+                <span id="downloadSpinner" class="spinner small hidden"></span>
+                <span id="downloadText">엑셀 다운로드</span>
+              </button>
+              <div id="downloadProgress" class="operation-progress compact-progress hidden" aria-live="polite">
+                <div class="progress-head">
+                  <span id="downloadProgressLabel">엑셀 생성 중</span>
+                  <span id="downloadProgressMeta">0% · 계산 중</span>
+                </div>
+                <div class="progress-track">
+                  <div id="downloadProgressBar" class="progress-fill"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <section id="resultSolveProgress" class="operation-progress wide-progress result-progress floating-progress cancellable-progress hidden" aria-live="polite">
+            <div class="progress-main">
+              <div class="progress-head">
+                <span id="resultSolveProgressLabel">근무표 다시 생성 중</span>
+                <span id="resultSolveProgressMeta">0% · 계산 중</span>
+              </div>
+              <div class="progress-track">
+                <div id="resultSolveProgressBar" class="progress-fill"></div>
+              </div>
+            </div>
+            <button id="resultSolveCancelBtn" class="progress-cancel" type="button">취소</button>
+          </section>
+          <div id="resultWarnings" class="result-warnings hidden"></div>
+          <div id="resultTableWrap" class="table-wrap result-wrap"></div>
+        </section>
+      </main>
+    </div>
+
+    <dialog id="confirmDialog">
+      <form method="dialog">
+        <h2>설정 초기화</h2>
+        <p>좌측 설정값만 기본값으로 되돌립니다. 업로드한 엑셀과 현재 표의 이름/행은 유지됩니다.</p>
+        <div class="dialog-actions">
+          <button value="cancel" type="submit">취소</button>
+          <button id="confirmResetSettingsBtn" class="danger" value="confirm" type="submit">초기화</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script src="/web/app.js?v=20260513-toast-dedupe"></script>
+  </body>
+</html>

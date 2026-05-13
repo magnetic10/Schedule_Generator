@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# Local environments
+.venv/
+venv/
+env/
+
+# Runtime/user data
+storage/
+*.log
+debug_app.log
+
+# Local development history may contain private paths or sample names.
+docs/PROGRESS_LOG.md
+
+# Build outputs
+build/
+dist/
+*.spec
+
+# User exported/imported files
+*.json
+*.xlsx
+!templates/
+!templates/default_template.xlsx
+
+# OS/editor
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+
+# Local scratch files
+write_*_test.bin
+temp_*
+test_output.*
