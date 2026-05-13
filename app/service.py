@@ -641,7 +641,7 @@ def _validate_target_hours_within_work_period(req: ScheduleRequest, days_in_mont
             f"{label}: 근무 가능 기간은 {start_day}~{end_day}일, 총 {active_days}일입니다. "
             f"현재 고정 근무를 반영한 최대 인정 가능 시간은 {max_hours}시간인데 "
             f"목표시간 {target_hours}시간은 8시간 기준 {required_days}일이 필요해 근무 시간이 초과됩니다. "
-            "시작일/종료일을 넓히거나 목표시간, 연가, 특수근무 입력을 조정해 주세요."
+            "시작일/종료일을 넓히거나 목표시간, 연가, 기타 근무 입력을 조정해 주세요."
         )
 
 
@@ -663,7 +663,7 @@ def _worker_max_credit_hours(
         if shift and shift not in FIXED_SHIFT_CODES:
             token = str(shift).strip()
             if token not in special_shifts:
-                raise SchedulerError(f"특수 근무 '{token}'의 인정 시간이 설정에 없습니다.")
+                raise SchedulerError(f"기타 근무 '{token}'의 인정 시간이 설정에 없습니다.")
             total += int(special_shifts[token])
         else:
             total += 8
@@ -699,7 +699,7 @@ def _non_to_credit_hours(req: ScheduleRequest) -> tuple[int, int]:
                 if not token:
                     continue
                 if token not in special_shifts:
-                    raise SchedulerError(f"특수 근무 '{token}'의 인정 시간이 설정에 없습니다.")
+                    raise SchedulerError(f"기타 근무 '{token}'의 인정 시간이 설정에 없습니다.")
                 special_credit_hours += int(special_shifts[token])
 
     return leave_credit_hours, special_credit_hours

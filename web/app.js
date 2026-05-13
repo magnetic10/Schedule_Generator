@@ -665,11 +665,11 @@ function addSpecialShift() {
   const code = $("specialCodeInput").value.trim();
   const hours = optionalInt($("specialHoursInput").value);
   if (!code || code.length !== 1 || ["주", "야", "비", "휴", "연", "-"].includes(code)) {
-    showMessage("특수근무 약어를 확인해 주세요.", "error");
+    showMessage("기타 근무 약어를 확인해 주세요.", "error");
     return;
   }
   if (hours === null || hours < 0 || hours > 24) {
-    showMessage("특수근무 인정시간을 확인해 주세요.", "error");
+    showMessage("기타 근무 인정시간을 확인해 주세요.", "error");
     return;
   }
   markDirty();
@@ -1162,11 +1162,11 @@ function renderGuide(guide) {
       ${metric("연가 인정", `${guide.leave_credit_hours}h`, {
         tip: "직접 지정한 연가의 인정시간 합계입니다.",
       })}
-      ${metric("특수 인정", `${guide.special_credit_hours}h`, {
-        tip: "직접 지정한 특수근무의 인정시간 합계입니다.",
+      ${metric("기타 인정", `${guide.special_credit_hours}h`, {
+        tip: "직접 지정한 기타 근무의 인정시간 합계입니다.",
       })}
       ${metric("현재 인정일", `${creditedDays}일`, {
-        tip: "연가 인정시간과 특수근무 인정시간을 8시간 단위의 일수로 환산한 값입니다.",
+        tip: "연가 인정시간과 기타 근무 인정시간을 8시간 단위의 일수로 환산한 값입니다.",
       })}
       ${metric(capacityLabel, `${guide.max_regular_capacity_hours}h`, {
         tip: guide.uses_emergency_range
@@ -1175,7 +1175,7 @@ function renderGuide(guide) {
       })}
       ${metric("연가 부족", `${guide.suggested_leave_days}일`, {
         danger: needsExtraLeave,
-        tip: "인원 설정 조건을 만족하려면 추가로 필요한 연가 또는 특수근무 일수입니다.",
+        tip: "인원 설정 조건을 만족하려면 추가로 필요한 연가 또는 기타 근무 일수입니다.",
       })}
     </div>
     <p>${escapeHtml(guide.message)}</p>

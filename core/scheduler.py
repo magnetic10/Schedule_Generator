@@ -544,7 +544,7 @@ def _solve_schedule_attempt(
 			if isinstance(val, str):
 				if val not in special_shifts:
 					raise SchedulerError(
-						f"{worker.name}: 특수 근무 '{val}'의 인정 시간이 설정에 없습니다."
+						f"{worker.name}: 기타 근무 '{val}'의 인정 시간이 설정에 없습니다."
 					)
 				credit += special_shifts[val]
 		custom_credit_by_worker.append(credit)
@@ -597,14 +597,14 @@ def _solve_schedule_attempt(
 		if worker.prev_month_last_day_night:
 			if isinstance(forced.get(0), str):
 				raise SchedulerError(
-					f"{worker.name}: 지난달 말 야간 처리와 1일 특수근무가 충돌합니다."
+					f"{worker.name}: 지난달 말 야간 처리와 1일 기타 근무가 충돌합니다."
 				)
 			model.Add(x[w_idx, 0, SHIFT_OFF_NIGHT] == 1)
 
 			if num_days >= 2:
 				if isinstance(forced.get(1), str):
 					raise SchedulerError(
-						f"{worker.name}: 지난달 말 야간 처리와 2일 특수근무가 충돌합니다."
+						f"{worker.name}: 지난달 말 야간 처리와 2일 기타 근무가 충돌합니다."
 					)
 				model.Add(x[w_idx, 1, SHIFT_OFF] == 1)
 		else:
