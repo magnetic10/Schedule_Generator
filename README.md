@@ -10,7 +10,7 @@
   <img alt="Windows 실행파일 다운로드" src="https://img.shields.io/badge/Windows%20%EC%8B%A4%ED%96%89%ED%8C%8C%EC%9D%BC-%EB%8B%A4%EC%9A%B4%EB%A1%9C%EB%93%9C-2ea44f?style=for-the-badge">
 </a>
 
-최신 실행파일은 [Releases 페이지](https://github.com/magnetic10/Schedule_Generator/releases/latest)에서도 받을 수 있습니다.
+최신 실행파일은 [Releases 페이지](https://github.com/magnetic10/Schedule_Generator/releases/latest)에서 다운받을 수 있습니다.
 
 ## 주요 기능
 
@@ -39,7 +39,7 @@
 http://127.0.0.1:8007/
 ```
 
-8007번 주소가 이미 사용 중이면 프로그램이 다른 번호의 주소를 자동으로 사용합니다.
+8007번 주소가 이미 사용 중이면 프로그램이 다른 번호의 주소가 자동으로 사용됩니다.
 
 ## 기본 사용 순서
 
