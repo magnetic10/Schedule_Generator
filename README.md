@@ -14,7 +14,7 @@
 
 최신 실행파일은 [Releases 페이지](https://github.com/magnetic10/Schedule_Generator/releases/latest)에서 다운받을 수 있습니다.
 
-또는 https://huggingface.co/spaces/magnetic10/schedule-generator 에서 웹 버전으로 사용할 수 있습니다.
+또는 https://huggingface.co/spaces/magnetic10/schedule-generator 에서 다운로드 없이 웹 버전으로 사용할 수 있습니다.
 
 ## 화면 예시
 
