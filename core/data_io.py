@@ -23,6 +23,7 @@ HEADER_KEYWORDS = {
     "요일", "일자", "월일", "날짜", "성명", "이름", "근무자명", "대상자",
 }
 PLACEHOLDER_NAME_RE = re.compile(r"^(근무자|직원|이름|성명)\s*\d+$")
+ALPHA_PLACEHOLDER_NAME_RE = re.compile(r"^[A-Za-z]{1,3}$")
 MONTH_TEXT_RE = re.compile(r"(\d{4}\s*년\s*)?\d{1,2}\s*월")
 HANGUL_NAME_RE = re.compile(r"^[가-힣]{2,}(?:[·\s]?[가-힣]{1,})?$")
 
@@ -220,7 +221,8 @@ def _is_number_like(value) -> bool:
 
 
 def _is_placeholder_name(value: str) -> bool:
-    return bool(PLACEHOLDER_NAME_RE.match(_cell_text(value).replace(" ", "")))
+    text = _cell_text(value).replace(" ", "")
+    return bool(PLACEHOLDER_NAME_RE.match(text) or ALPHA_PLACEHOLDER_NAME_RE.match(text))
 
 
 def _is_excluded_name_text(value: str) -> bool:
@@ -998,6 +1000,15 @@ def _is_basic_template_path(template_path: str) -> bool:
     return "기본 틀" in basename or basename == "default_template.xlsx"
 
 
+def _kr_holiday_dates(year: int) -> set[datetime.date]:
+    try:
+        import holidays
+
+        return set(holidays.KR(years=year).keys())
+    except Exception:
+        return set()
+
+
 def _set_cell_border_side(cell, side_name: str, side) -> None:
     cell.border = _with_replaced_border_side(cell.border, side_name, side)
 
@@ -1019,6 +1030,8 @@ def _finalize_basic_template_layout(
     worker_row_step: int,
     worker_data_row_offset: int,
     num_days: int,
+    year: int | None = None,
+    month: int | None = None,
 ) -> None:
     """기본 틀 계열의 통계 수식과 테두리를 최종 구조 기준으로 재작성한다."""
     if worker_count <= 0 or num_days <= 0:
@@ -1039,9 +1052,9 @@ def _finalize_basic_template_layout(
         "비": right_stat_col + 2,
         "휴": right_stat_col + 3,
         "연": right_stat_col + 4,
-        "근무시간": right_stat_col + 5,
+        "시간": right_stat_col + 5,
     }
-    time_col = stat_cols["근무시간"]
+    time_col = stat_cols["시간"]
     footer_row = worker_row_start + worker_count * worker_row_step
     footer_labels = [("주간", "주"), ("야간", "야"), ("비번", "비"), ("휴무", "휴")]
     last_footer_row = footer_row + len(footer_labels) - 1
@@ -1051,6 +1064,17 @@ def _finalize_basic_template_layout(
     )
     date_start_letter = get_column_letter(date_col_start)
     date_end_letter = get_column_letter(last_date_col)
+    kr_holidays = _kr_holiday_dates(year) if year is not None else set()
+
+    if day_row and year is not None and month is not None:
+        for day_idx in range(num_days):
+            current_date = datetime.date(year, month, day_idx + 1)
+            if current_date not in kr_holidays:
+                continue
+            cell = ws.cell(day_row, date_col_start + day_idx)
+            new_font = copy(cell.font)
+            new_font.color = "FFFF0000"
+            cell.font = new_font
 
     for label, col in stat_cols.items():
         ws.cell(label_row, col).value = label
@@ -1069,7 +1093,7 @@ def _finalize_basic_template_layout(
             f'{get_column_letter(stat_cols["야"])}{data_row}',
             f'{get_column_letter(stat_cols["비"])}{data_row}',
         ]
-        ws.cell(data_row, stat_cols["근무시간"]).value = f'=({" + ".join(row_refs)})*8'
+        ws.cell(data_row, time_col).value = f'=({" + ".join(row_refs)})*8'
 
     for offset, (label, shift_token) in enumerate(footer_labels):
         row = footer_row + offset
@@ -1157,6 +1181,59 @@ def _finalize_basic_template_layout(
             ws.cell(row, col).border = _with_replaced_border_side(ws.cell(row, col).border, "bottom", Side())
             ws.cell(row, col).border = _with_replaced_border_side(ws.cell(row, col).border, "left", Side())
             ws.cell(row, col).border = _with_replaced_border_side(ws.cell(row, col).border, "right", Side())
+
+    for col in range(right_stat_col, time_col + 1):
+        cell = ws.cell(date_row, col)
+        cell.border = _with_replaced_border_side(cell.border, "top", Side())
+        cell.border = _with_replaced_border_side(cell.border, "right", Side())
+        if col >= right_stat_col + 1:
+            cell.border = _with_replaced_border_side(cell.border, "left", Side())
+
+    # 기본 틀은 날짜 수가 줄거나 늘어도 근무 칸에만 조건부서식이 남아야 한다.
+    # openpyxl은 열 삭제 시 조건부서식 범위를 자동 축소하지 않아 여기서 최종 범위를 다시 건다.
+    try:
+        from openpyxl.utils.cell import range_boundaries
+
+        cf_entries = []
+        for cf_range in list(ws.conditional_formatting):
+            rules = [copy(rule) for rule in ws.conditional_formatting[cf_range]]
+            cf_entries.append((str(cf_range.sqref), rules))
+
+        ws.conditional_formatting._cf_rules.clear()
+        for original_range, rules in cf_entries:
+            first_range = original_range.split()[0]
+            min_col, min_row, max_col, max_row = range_boundaries(first_range)
+            if max_col < date_col_start or min_col > last_date_col:
+                target_range = original_range
+            elif min_row <= label_row <= max_row and min_row < worker_row_start:
+                target_range = (
+                    f"{get_column_letter(date_col_start)}{label_row}:"
+                    f"{get_column_letter(last_date_col)}{last_worker_data_row}"
+                )
+            elif min_row >= worker_row_start:
+                target_range = (
+                    f"{get_column_letter(date_col_start)}{first_worker_data_row}:"
+                    f"{get_column_letter(last_date_col)}{last_worker_data_row}"
+                )
+            else:
+                target_range = (
+                    f"{get_column_letter(date_col_start)}{min_row}:"
+                    f"{get_column_letter(last_date_col)}{max_row}"
+                )
+
+            for rule in rules:
+                ws.conditional_formatting.add(target_range, copy(rule))
+    except Exception:
+        pass
+
+    # 기본 틀의 우측/하단 통계 영역은 날짜/인원 변경 후에도 일정한 크기로 정리한다.
+    for col in range(right_stat_col, time_col):
+        ws.column_dimensions[get_column_letter(col)].width = 4.8
+    ws.column_dimensions[get_column_letter(time_col)].width = 8.4
+    for row in range(footer_row, last_footer_row + 1):
+        ws.row_dimensions[row].height = 30
+
+    ws.cell(last_footer_row + 1, name_col).value = "통계는 '편집 사용'버튼을 눌러야 보입니다."
 
     try:
         wb.calculation.calcMode = "auto"
@@ -1472,6 +1549,8 @@ def export_to_excel_openpyxl(
             worker_row_step=w_row_step,
             worker_data_row_offset=w_data_offset,
             num_days=num_days,
+            year=year,
+            month=month,
         )
     elif diff != 0:
         _normalize_worker_footer_separator(
@@ -1687,6 +1766,8 @@ def export_to_excel(template_path: str, output_path: str,
             worker_row_step=w_row_step,
             worker_data_row_offset=w_data_offset,
             num_days=num_days,
+            year=year,
+            month=month,
         )
     elif diff != 0:
         _normalize_worker_footer_separator(

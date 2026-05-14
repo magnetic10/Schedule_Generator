@@ -1460,6 +1460,23 @@ class ScheduleServiceTests(unittest.TestCase):
         workers = build_workers([WorkerInput(name="", target_hours=0)], days_in_month=30)
         self.assertEqual(workers[0].name, "")
 
+        req = ScheduleRequest(
+            year=2026,
+            month=6,
+            workers=[WorkerInput(name="", target_hours=0)],
+            settings=ScheduleSettings(
+                target_day=0,
+                target_night=0,
+                min_day=0,
+                max_day=0,
+                min_night=0,
+                max_night=0,
+            ),
+            random_seed=0,
+        )
+        result = solve_request(req)
+        self.assertEqual(result.rows[0].name, "")
+
     def test_solver_does_not_auto_assign_leave(self) -> None:
         req = ScheduleRequest(
             year=2026,
@@ -1954,14 +1971,14 @@ class ScheduleServiceTests(unittest.TestCase):
         self.assertEqual(result.template_info["date_row"], 3)
         self.assertEqual(result.template_info["worker_row_start"], 5)
 
-    def test_export_schedule_result_to_excel_calls_core_export_with_display_names(self) -> None:
+    def test_export_schedule_result_to_excel_passes_result_names(self) -> None:
         result = ScheduleResult(
             year=2026,
             month=6,
             days_in_month=2,
             status="OPTIMAL",
             rows=[
-                WorkerScheduleRow(name="A", days=["주", "교육"], raw_days=[SHIFT_DAY, "교육"]),
+                WorkerScheduleRow(name="", days=["주", "교육"], raw_days=[SHIFT_DAY, "교육"]),
                 WorkerScheduleRow(name="김철수", days=["휴", "야"], raw_days=[SHIFT_OFF, SHIFT_NIGHT]),
             ],
             day_counts=[1, 0],
@@ -1985,7 +2002,7 @@ class ScheduleServiceTests(unittest.TestCase):
         self.assertEqual(kwargs["year"], 2026)
         self.assertEqual(kwargs["month"], 6)
         self.assertFalse(kwargs["apply_shift_colors"])
-        self.assertEqual([worker.name for worker in kwargs["workers"]], ["A", "김철수"])
+        self.assertEqual([worker.name for worker in kwargs["workers"]], ["", "김철수"])
         self.assertEqual(kwargs["schedule"], [[SHIFT_DAY, "교육"], [SHIFT_OFF, SHIFT_NIGHT]])
         self.assertEqual(export_result.filename, default_excel_filename(2026, 6))
         self.assertEqual(export_result.worker_count, 2)
@@ -2250,7 +2267,7 @@ class ScheduleServiceTests(unittest.TestCase):
             self.assertEqual(ws["AI4"].value, "비")
             self.assertEqual(ws["AJ4"].value, "휴")
             self.assertEqual(ws["AK4"].value, "연")
-            self.assertEqual(ws["AL4"].value, "근무시간")
+            self.assertEqual(ws["AL4"].value, "시간")
             self.assertEqual(ws["AH5"].value, '=COUNTIF(B5:AF5,"야")')
             self.assertEqual(ws["AL5"].value, "=(AG5 + AK5 + AH5 + AI5)*8")
             self.assertEqual(ws["B15"].value, '=COUNTIF(B5:B14,"주")')

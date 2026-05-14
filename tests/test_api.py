@@ -62,7 +62,7 @@ class ApiTests(unittest.TestCase):
         )
 
         self.assertTrue(data["success"])
-        self.assertEqual(data["result"]["rows"][0]["name"], "A")
+        self.assertEqual(data["result"]["rows"][0]["name"], "")
         self.assertEqual(len(data["result"]["rows"][0]["days"]), 31)
 
     def test_solve_endpoint_reports_target_hours_over_work_period_capacity(self) -> None:

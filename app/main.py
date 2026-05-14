@@ -60,6 +60,8 @@ UPLOAD_DIR = STORAGE_DIR / "uploads"
 OUTPUT_DIR = STORAGE_DIR / "outputs"
 DEBUG_DIR = STORAGE_DIR / "debug"
 DEFAULT_TEMPLATE_CANDIDATES = (
+    BASE_DIR.parent / "근무표서식" / "기본 틀v2.xlsx",
+    RUNTIME_DIR.parent / "근무표서식" / "기본 틀v2.xlsx",
     BASE_DIR / "templates" / "default_template.xlsx",
     RUNTIME_DIR / "templates" / "default_template.xlsx",
 )

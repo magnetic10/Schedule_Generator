@@ -415,7 +415,7 @@ def _schedule_result_from_solver(
     days_in_month = calendar.monthrange(req.year, req.month)[1]
     rows = [
         WorkerScheduleRow(
-            name=display_worker_name(worker.name, idx),
+            name=str(worker.name or "").strip(),
             raw_days=list(schedule[idx]),
             days=[
                 SHIFT_TO_STR.get(value, str(value)) if isinstance(value, int) else value
